@@ -2,32 +2,39 @@
 """Analyze radar performance across a Carrier Strike Group.
 
 By default this runs a live scenario: every 4 seconds the simulated clock
-advances, scheduled radar losses are applied, and the map is redrawn.
-The monitor stops on its own after 80 seconds. Pass --once to analyze a
-pair of CSV files a single time instead.
+advances, the matching rows are read from snooze_cruise.csv, and the map
+is redrawn. The monitor stops on its own after 80 seconds. Pass --once to
+analyze a pair of CSV files a single time instead.
 
 Example usage
 -------------
 Live monitor (stops after 80 seconds, or sooner on Ctrl+C). Change
-UPDATE_INTERVAL_SECONDS and TOTAL_RUNTIME_SECONDS below to adjust the
-loop. Replace radar_timeline.csv to change when radars degrade.
+UPDATE_INTERVAL_SECONDS and TOTAL_RUNTIME_SECONDS below to adjust the loop.
+Edit snooze_cruise.csv to move the ships or change when radars degrade.
 
     python3 analyze_radar.py
     python3 analyze_radar.py --interval 4 --runtime 80
-    python3 analyze_radar.py --timeline radar_timeline.csv
 
-radar_timeline.csv columns:
-    time_seconds, ship_id, new_capacity_percent
-    new_radar_status   (optional: OK, DEGRADED, or FAILED)
+snooze_cruise.csv is the only live data file. One row per ship per time
+step. It holds positions, radar metrics, and the capacity schedule:
 
-Each row is applied when the scenario clock reaches time_seconds and then
-holds. A later row for the same ship replaces the earlier one. If this
-file is missing, or you pass --no-timeline, every radar stays at 100%.
+    time_seconds, timestamp, ship_id, ship_name, ship_type
+    latitude, longitude, current_heading
+    radar_status, capacity_percent
+    full_range_km, max_range_km, effective_range_km
+    num_detections, avg_snr_db
+    elevation_coverage_deg, azimuth_coverage_deg
+    track_quality, radar_mode
+    threat_bearing_deg
+    threat_range_km, threat_priority   (optional)
+    power_status, cooling_status, last_maintenance, fault_code
 
-    time_seconds,ship_id,new_capacity_percent,new_radar_status
-    12,DDG-101,60,DEGRADED
-    32,CG-58,0,FAILED
-    52,DDG-112,40,DEGRADED
+Latitude, longitude, and threat_bearing_deg change with time_seconds.
+capacity_percent in the same file is the outage schedule (for example 60
+at T+12 s, 0 at T+32 s, 40 at T+52 s). The loop picks or interpolates the
+rows for the current clock. Courses cover the threat axis from stations
+at least 25° off that axis, so no ship is steered onto the threat vector.
+Recommendations are still produced when every radar is at 100%.
 
 One-shot CSV analysis:
 
@@ -82,6 +89,7 @@ LOCATION_COLUMNS = [
 STATUS_FIGURE = Path("strike_group_radar_status.png")
 COURSE_FIGURE = Path("strike_group_recommended_courses.png")
 LIVE_STATE_FIGURE = Path("live_ship_state.csv")
+SNOOZE_FILE = Path("snooze_cruise.csv")
 TIMELINE_FILE = Path("radar_timeline.csv")
 TIMELINE_COLUMNS = ["time_seconds", "ship_id", "new_capacity_percent"]
 
@@ -162,6 +170,10 @@ RANK_LABELS = ["Best", "Acceptable", "Fallback"]
 # The outer ring is set from the longest healthy radar so station position
 # still changes the result. Both are sampled every 5 degrees.
 INNER_RANGE_KM = 40.0
+# Stations and courses must stay at least this far from the threat bearing.
+THREAT_EXCLUSION_DEG = 25.0
+# Coverage score emphasizes this half-width on either side of the threat axis.
+THREAT_FOCUS_HALF_DEG = 45.0
 AZIMUTH_BINS = 72
 KM_PER_DEG_LAT = 110.574
 
@@ -605,6 +617,41 @@ def _failed_sector_coverage(
     return 100.0 * hits / total
 
 
+def _off_threat_axis(bearing: float, threat: float, exclusion: float = THREAT_EXCLUSION_DEG) -> float:
+    """Slide a station bearing out of the cone centered on the threat axis."""
+    if wrap_delta(bearing, threat) >= exclusion:
+        return bearing % 360.0
+    delta = (bearing - threat + 180.0) % 360.0 - 180.0
+    sign = 1.0 if delta > 0 else -1.0
+    return (threat + sign * exclusion) % 360.0
+
+
+def _heading_clear(heading: float, threat: float, exclusion: float = THREAT_EXCLUSION_DEG) -> bool:
+    """True when a course does not point along the threat vector."""
+    return wrap_delta(heading, threat) >= exclusion - 0.1
+
+
+def _threat_shoulders(count: int, threat: float, first_offset: float) -> list[float]:
+    """Stations on both sides of the threat axis, never inside the exclusion cone."""
+    if count <= 0:
+        return []
+    offsets: list[float] = []
+    step = max(first_offset, THREAT_EXCLUSION_DEG + 15.0)
+    index = 0
+    while len(offsets) < count:
+        side = 1.0 if index % 2 == 0 else -1.0
+        ring = 1 + index // 2
+        offsets.append(side * min(step * ring, 150.0))
+        index += 1
+    bearings: list[float] = []
+    for offset in offsets:
+        bearing = _off_threat_axis((threat + offset) % 360.0, threat)
+        while any(wrap_delta(bearing, other) < 12.0 for other in bearings):
+            bearing = _off_threat_axis((bearing + 15.0) % 360.0, threat)
+        bearings.append(bearing)
+    return bearings
+
+
 def _build_plan(
     name: str,
     rationale: str,
@@ -617,6 +664,7 @@ def _build_plan(
     ranges: dict[str, float],
     outer_range: float,
     failed_bearings: list[float],
+    threat_bearing: float | None = None,
 ) -> dict:
     """One course set: a station for every healthy escort, plus coverage numbers."""
     _cost, pairs = _assignment_cost(escorts, bearings, station_range, origin_lat, origin_lon)
@@ -636,13 +684,38 @@ def _build_plan(
     screen_reach: list[float] = []
 
     for escort, station_bearing in pairs:
+        if threat_bearing is not None:
+            station_bearing = _off_threat_axis(station_bearing, threat_bearing)
         station_east, station_north = point_at(station_bearing, station_range)
         current_east, current_north = to_xy(
             escort["latitude"], escort["longitude"], origin_lat, origin_lon
         )
         course = bearing_deg(station_east - current_east, station_north - current_north)
         travel = float(np.hypot(station_east - current_east, station_north - current_north))
-        if travel < 0.5 and escort["heading"] is not None:
+        if threat_bearing is not None:
+            # Step the station further off the axis until the course itself is clear.
+            for _step in range(8):
+                if _heading_clear(course, threat_bearing) and wrap_delta(station_bearing, threat_bearing) >= THREAT_EXCLUSION_DEG - 0.1:
+                    break
+                delta = (station_bearing - threat_bearing + 180.0) % 360.0 - 180.0
+                sign = 1.0 if delta >= 0 else -1.0
+                station_bearing = (threat_bearing + sign * (abs(delta) + 8.0)) % 360.0
+                station_east, station_north = point_at(station_bearing, station_range)
+                course = bearing_deg(station_east - current_east, station_north - current_north)
+                travel = float(np.hypot(station_east - current_east, station_north - current_north))
+            if not _heading_clear(course, threat_bearing):
+                station_east, station_north = current_east, current_north
+                station_bearing = bearing_deg(current_east, current_north) if travel > 0.1 else station_bearing
+                course = escort["heading"] if escort["heading"] is not None else course
+                if not _heading_clear(course, threat_bearing):
+                    course = _off_threat_axis(course, threat_bearing)
+                travel = 0.0
+                latitude, longitude = escort["latitude"], escort["longitude"]
+            else:
+                latitude, longitude = to_latlon(station_east, station_north, origin_lat, origin_lon)
+        else:
+            latitude, longitude = to_latlon(station_east, station_north, origin_lat, origin_lon)
+        if travel < 0.5 and escort["heading"] is not None and threat_bearing is None:
             course = escort["heading"]
         latitude, longitude = to_latlon(station_east, station_north, origin_lat, origin_lon)
         sector_start, sector_end = _sector_bounds(station_bearing, ordered)
@@ -653,7 +726,7 @@ def _build_plan(
                 "ship_type": escort["ship_type"],
                 "heading": course,
                 "station_bearing": station_bearing,
-                "station_range_km": station_range,
+                "station_range_km": float(np.hypot(station_east, station_north)),
                 "sector_start": sector_start,
                 "sector_end": sector_end,
                 "latitude": escort["latitude"],
@@ -673,6 +746,8 @@ def _build_plan(
 
     if hvu is not None:
         hold_heading = hvu["heading"] if hvu["heading"] is not None else 0.0
+        if threat_bearing is not None and not _heading_clear(hold_heading, threat_bearing):
+            hold_heading = _off_threat_axis(hold_heading, threat_bearing)
         moves.insert(
             0,
             {
@@ -696,10 +771,23 @@ def _build_plan(
     outer_pct, outer_gaps = ring_coverage(screen_positions, screen_reach, outer_range)
     inner_pct, inner_gaps = ring_coverage(positions, reach, INNER_RANGE_KM)
     failed_pct = _failed_sector_coverage(screen_positions, screen_reach, outer_range, failed_bearings)
+    threat_pct = (
+        _failed_sector_coverage(screen_positions, screen_reach, outer_range, [threat_bearing])
+        if threat_bearing is not None
+        else failed_pct
+    )
     mean_travel = float(np.mean([move["travel_km"] for move in moves if move["role"] == "escort"] or [0.0]))
-    # Close the outer ring first, keep the inner ring covered, favor the
-    # bearing the failed ship used to hold, then prefer a shorter move.
-    score = outer_pct + 0.25 * inner_pct + 0.2 * failed_pct - 0.35 * mean_travel
+    unsafe = 0
+    if threat_bearing is not None:
+        unsafe = sum(
+            1
+            for move in moves
+            if move["role"] == "escort"
+            and move["travel_km"] > 0.5
+            and not _heading_clear(move["heading"], threat_bearing)
+        )
+    # Threat-axis coverage counts more than the far side of the ring.
+    score = 1.6 * threat_pct + 0.35 * outer_pct + 0.15 * inner_pct - 0.25 * mean_travel - 40.0 * unsafe
 
     return {
         "name": name,
@@ -711,6 +799,8 @@ def _build_plan(
         "inner_pct": inner_pct,
         "inner_gaps": inner_gaps,
         "failed_sector_pct": failed_pct,
+        "threat_pct": threat_pct,
+        "threat_bearing": threat_bearing,
         "outer_range_km": outer_range,
         "score": score,
         "positions": screen_positions,
@@ -722,12 +812,13 @@ def recommend_courses(
     locations: pd.DataFrame,
     ranges: dict[str, float],
     capacity: dict[str, float],
+    threat_bearing: float | None = None,
 ) -> tuple[list[dict], str, float]:
     """Three stationing plans ranked Best / Acceptable / Fallback.
 
     Escorts with any remaining capacity are stationed. Their reach is already
-    scaled. Ships at 0% stay off the screen. The gap bearing prefers a total
-    loss, then any ship that is short of full capacity.
+    scaled. Ships at 0% stay off the screen. When a threat bearing is given,
+    stations sit on either side of that axis and no course points along it.
     """
     ships = _located_ships(locations)
     if not ships:
@@ -762,26 +853,50 @@ def recommend_courses(
             failed_bearings.append(bearing_deg(east, north))
     gap_offset = circular_mean(failed_bearings) if failed_bearings else (balanced_offset + 40.0) % 360.0
 
-    templates = [
-        (
-            "Balanced screen",
-            "Even stations around the datum so neighboring radars overlap and no wide sector is left to one ship.",
-            even_bearings(len(escorts), balanced_offset),
-            balanced_range,
-        ),
-        (
-            "Gap closure",
-            "Rotate the screen so a radar with remaining capacity sits on the bearing where capacity was lost.",
-            even_bearings(len(escorts), gap_offset),
-            24.0,
-        ),
-        (
-            "Close screen",
-            "Shorter move and a tighter station around the carrier, so the inner circle stays covered while the escorts travel less.",
-            even_bearings(len(escorts), (balanced_offset + 180.0 / len(escorts)) % 360.0),
-            10.0,
-        ),
-    ]
+    if threat_bearing is None:
+        templates = [
+            (
+                "Balanced screen",
+                "Even stations around the datum so neighboring radars overlap and no wide sector is left to one ship.",
+                even_bearings(len(escorts), balanced_offset),
+                balanced_range,
+            ),
+            (
+                "Gap closure",
+                "Rotate the screen so a radar with remaining capacity sits on the bearing where capacity was lost.",
+                even_bearings(len(escorts), gap_offset),
+                24.0,
+            ),
+            (
+                "Close screen",
+                "Shorter move and a tighter station around the carrier, so the inner circle stays covered while the escorts travel less.",
+                even_bearings(len(escorts), (balanced_offset + 180.0 / len(escorts)) % 360.0),
+                10.0,
+            ),
+        ]
+    else:
+        # Shoulders cover the threat axis from either side. Nothing is placed
+        # inside the exclusion cone, and the rear plan keeps some 360° watch.
+        templates = [
+            (
+                "Threat shoulders",
+                "Stations 40° either side of the threat axis so the radars cover that sector without any ship steaming onto it.",
+                _threat_shoulders(len(escorts), threat_bearing, 40.0),
+                18.0,
+            ),
+            (
+                "Wide threat arc",
+                "A wider flank on the threat, still outside the 25° exclusion cone, with less weight on the opposite side.",
+                _threat_shoulders(len(escorts), threat_bearing, 55.0),
+                22.0,
+            ),
+            (
+                "Flank and rear",
+                "Escorts abeam of the threat and toward the low-threat side, keeping the axis covered while preserving some all-round watch.",
+                _threat_shoulders(len(escorts), threat_bearing, 90.0),
+                16.0,
+            ),
+        ]
 
     plans = [
         _build_plan(
@@ -796,6 +911,7 @@ def recommend_courses(
             ranges,
             outer_range,
             failed_bearings,
+            threat_bearing,
         )
         for name, rationale, bearings, station_range in templates
     ]
@@ -843,6 +959,12 @@ def print_recommendations(
         print(f"Residual gaps at {plan['outer_range_km']:.0f} km: {plan['outer_gaps']}")
         print(f"Residual gaps at {INNER_RANGE_KM:.0f} km: {plan['inner_gaps']}")
         print(f"Reduced-capacity sector still covered: {plan['failed_sector_pct']:.0f}%")
+        if plan.get("threat_bearing") is not None:
+            print(
+                f"Threat-axis coverage (±30° of {plan['threat_bearing']:.0f}°): "
+                f"{plan['threat_pct']:.0f}%"
+            )
+            print(f"Stations stay at least {THREAT_EXCLUSION_DEG:.0f}° off the threat axis.")
         for move in plan["moves"]:
             print()
             remaining = capacity.get(move["ship_id"], 100.0)
@@ -950,6 +1072,10 @@ def _course_note(report: pd.DataFrame, plans: list[dict]) -> str:
             f"  |  inner {best['inner_pct']:.0f}%"
         ),
     ]
+    if best.get("threat_bearing") is not None:
+        lines.append(
+            f"Threat {best['threat_bearing']:.0f}°  axis cover {best['threat_pct']:.0f}%"
+        )
     listed: set[str] = set()
     for move in best["moves"]:
         listed.add(move["ship_id"])
@@ -995,12 +1121,41 @@ def _corner_text(axis, x: float, y: float, text: str, horizontal: str, vertical:
     )
 
 
+def _draw_threat(axis, locations: pd.DataFrame, bearing: float) -> None:
+    """Arrow and a short sector showing where the threat axis lies."""
+    carriers = locations.loc[
+        locations["ship_type"].astype(str).str.contains("carrier", case=False, na=False)
+    ]
+    origin = carriers.iloc[0] if len(carriers) else locations.iloc[0]
+    origin_lat = float(origin["latitude"])
+    origin_lon = float(origin["longitude"])
+    tip_east, tip_north = point_at(bearing, 30.0)
+    tip_lat, tip_lon = to_latlon(tip_east, tip_north, origin_lat, origin_lon)
+    axis.annotate(
+        "",
+        xy=(tip_lon, tip_lat),
+        xytext=(origin_lon, origin_lat),
+        arrowprops={"arrowstyle": "-|>", "color": "#9B2226", "lw": 2.2, "mutation_scale": 14},
+        zorder=3,
+    )
+    wedge_lats = [origin_lat]
+    wedge_lons = [origin_lon]
+    for offset in np.linspace(-THREAT_FOCUS_HALF_DEG, THREAT_FOCUS_HALF_DEG, 24):
+        east, north = point_at((bearing + offset) % 360.0, 22.0)
+        lat, lon = to_latlon(east, north, origin_lat, origin_lon)
+        wedge_lats.append(lat)
+        wedge_lons.append(lon)
+    axis.fill(wedge_lons, wedge_lats, color="#9B2226", alpha=0.12, zorder=1)
+    axis.plot([], [], color="#9B2226", lw=2.2, label=f"Threat {bearing:.0f}°")
+
+
 def plot_status(
     locations: pd.DataFrame,
     report: pd.DataFrame,
     plans: list[dict],
     figure_path: Path,
     title: str | None = None,
+    threat_bearing: float | None = None,
 ) -> None:
     """Map of the group, with capacity and the best course noted in opposite corners."""
     places = _prepare_locations(locations).dropna(subset=["latitude", "longitude"])
@@ -1009,6 +1164,8 @@ def plot_status(
     figure, axis = plt.subplots(figsize=(11, 8))
     _draw_ships(axis, places, capacity)
     _draw_courses(axis, plans)
+    if threat_bearing is not None:
+        _draw_threat(axis, places, threat_bearing)
     # Upper left is capacity. Lower right is the best course, so the two notes
     # do not sit on top of each other.
     _corner_text(axis, 0.02, 0.98, _capacity_note(report), "left", "top")
@@ -1123,6 +1280,9 @@ def plot_best_course(plan: dict, origin_lat: float, origin_lon: float, datum_lab
                 break
     bar_colors = np.where(covered > 0, OPERATIONAL_COLOR, OUTAGE_COLOR)
     polar_axis.bar(angles, np.ones(AZIMUTH_BINS), width=np.deg2rad(step), color=bar_colors, align="edge")
+    if plan.get("threat_bearing") is not None:
+        threat_angle = np.deg2rad(float(plan["threat_bearing"]))
+        polar_axis.plot([threat_angle, threat_angle], [0.0, 1.0], color="#9B2226", lw=2.0, label="Threat")
     polar_axis.set_yticks([])
     polar_axis.set_title(f"Coverage at {plan['outer_range_km']:.0f} km\n{datum_label}", pad=16)
 
@@ -1132,19 +1292,31 @@ def plot_best_course(plan: dict, origin_lat: float, origin_lon: float, datum_lab
     print(f"Saved figure to {figure_path}")
 
 
-def analyze_frames(radar: pd.DataFrame, locations: pd.DataFrame, title: str | None = None) -> None:
+def analyze_frames(
+    radar: pd.DataFrame,
+    locations: pd.DataFrame,
+    title: str | None = None,
+    threat_bearing: float | None = None,
+    threat_range_km: float | None = None,
+) -> None:
     """Run the capacity report, course ranking, and both figures for one snapshot."""
     report = attach_locations(assess_capacity(radar, locations), locations)
     print_capacity(report)
+    if threat_bearing is not None:
+        span = f", range {threat_range_km:.0f} km" if threat_range_km is not None else ""
+        print(f"Threat bearing: {threat_bearing:.0f}° true{span}")
     capacity = {str(row.ship_id): float(row.capacity_percent) for row in report.itertuples(index=False)}
     ranges = effective_ranges(report)
-    if report["capacity_percent"].ge(99.5).all():
+    # A known threat still needs a screen when every radar is healthy.
+    if threat_bearing is None and report["capacity_percent"].ge(99.5).all():
         plot_status(locations, report, [], STATUS_FIGURE, title=title)
         return
 
-    plans, datum_label, outer_range = recommend_courses(locations, ranges, capacity)
+    plans, datum_label, outer_range = recommend_courses(
+        locations, ranges, capacity, threat_bearing=threat_bearing
+    )
     print_recommendations(plans, datum_label, outer_range, capacity, ranges)
-    plot_status(locations, report, plans, STATUS_FIGURE, title=title)
+    plot_status(locations, report, plans, STATUS_FIGURE, title=title, threat_bearing=threat_bearing)
     if plans:
         ships = _located_ships(locations)
         _hvu, origin_lat, origin_lon, _label = choose_datum(ships)
@@ -1164,7 +1336,7 @@ def run_once(radar_path: Path, location_path: Path) -> int:
     return 0
 
 
-def load_timeline(path: Path) -> list[dict]:
+def load_timeline(path: Path, known_ids: set[str]) -> list[dict]:
     """Read a degradation schedule. Events are ordered by time, then file order.
 
     A missing optional status leaves the script to label OK, DEGRADED, or
@@ -1189,12 +1361,11 @@ def load_timeline(path: Path) -> list[dict]:
     frame["ship_id"] = frame["ship_id"].astype(str).str.strip()
     # Stable sort keeps same-time rows in the order they appear in the file.
     frame = frame.sort_values("time_seconds", kind="mergesort")
-    known = {ship["ship_id"] for ship in FLEET}
     events: list[dict] = []
     for row in frame.itertuples(index=False):
         ship_id = str(row.ship_id)
-        if ship_id not in known:
-            print(f"Warning: timeline ship_id {ship_id} is not in the fleet and was skipped.")
+        if ship_id not in known_ids:
+            print(f"Warning: timeline ship_id {ship_id} is not in snooze_cruise.csv and was skipped.")
             continue
         status = str(row.new_radar_status).strip().upper()
         if status in {"", "NAN"}:
@@ -1235,51 +1406,251 @@ def _status_name(percent: float) -> str:
     return "DEGRADED"
 
 
-def ship_snapshot(ship: dict, elapsed_s: float, timestamp: pd.Timestamp, timeline: list[dict]) -> dict:
-    """One ship's detailed radar row at this scenario time.
+def _lerp(start: float, end: float, fraction: float) -> float:
+    return start + (end - start) * fraction
 
-    max_range_km stays at the full baseline so later scaling uses the real
-    radar, not an already-reduced number. effective_range_km is the scaled value.
+
+def _lerp_heading(start: float, end: float, fraction: float) -> float:
+    """Interpolate a compass heading across the short way around the circle."""
+    delta = (end - start + 180.0) % 360.0 - 180.0
+    return (start + delta * fraction) % 360.0
+
+
+def build_snooze_cruise() -> pd.DataFrame:
+    """Sample a moving formation and the capacity schedule into one table.
+
+    The group steams about 12 km and turns during the 80-second run.
+    Capacity changes are rows in this same file: DDG-101 to 60% at 12 s,
+    CG-58 to 0% at 32 s, and DDG-112 to 40% at 52 s.
     """
-    percent = capacity_at(ship["ship_id"], elapsed_s, timeline)
-    event = active_event(ship["ship_id"], elapsed_s, timeline)
-    fraction = percent / 100.0
-    status_override = event["radar_status"] if event and event["radar_status"] else ""
-    if percent >= 99.5:
-        mode, power, cooling, fault = "SEARCH", "NOMINAL", "NOMINAL", "NONE"
-    elif percent <= 0.5:
-        mode, power, cooling, fault = "STANDBY", "OFF", "SHUTDOWN", "TRANSMITTER_FAIL"
+    duration = float(TOTAL_RUNTIME_SECONDS)
+    times = np.arange(0.0, duration + 1e-9, float(UPDATE_INTERVAL_SECONDS))
+    carrier = next(ship for ship in FLEET if "carrier" in ship["ship_type"].lower())
+    origin_lat = float(carrier["latitude"])
+    origin_lon = float(carrier["longitude"])
+    offsets = {
+        ship["ship_id"]: to_xy(ship["latitude"], ship["longitude"], origin_lat, origin_lon)
+        for ship in FLEET
+    }
+    speed_km_s = 0.15
+    start_heading = 45.0
+    turn = 35.0
+    carrier_track: list[tuple[float, float, float]] = []
+    lat, lon = origin_lat, origin_lon
+    previous = 0.0
+    for instant in times:
+        if instant > 0:
+            step = float(instant - previous)
+            mid = start_heading + turn * ((instant + previous) / 2.0) / duration
+            east = speed_km_s * step * float(np.sin(np.deg2rad(mid)))
+            north = speed_km_s * step * float(np.cos(np.deg2rad(mid)))
+            lat = lat + north / KM_PER_DEG_LAT
+            lon = lon + east / km_per_deg_lon(lat)
+        heading = start_heading + turn * (float(instant) / duration)
+        carrier_track.append((lat, lon, heading))
+        previous = float(instant)
+
+    rows: list[dict] = []
+    for (instant, (carrier_lat, carrier_lon, heading)), _index in zip(
+        zip(times, carrier_track), range(len(times))
+    ):
+        theta = np.deg2rad(heading - start_heading)
+        cosine, sine = float(np.cos(theta)), float(np.sin(theta))
+        stamp = SCENARIO_START + pd.Timedelta(seconds=float(instant))
+        for ship in FLEET:
+            east, north = offsets[ship["ship_id"]]
+            rotated_east = east * cosine + north * sine
+            rotated_north = -east * sine + north * cosine
+            ship_lat, ship_lon = to_latlon(rotated_east, rotated_north, carrier_lat, carrier_lon)
+            percent = _scheduled_capacity(ship["ship_id"], float(instant))
+            scale = percent / 100.0
+            if percent >= 99.5:
+                status, mode, power, cooling, fault = "OK", "SEARCH", "NOMINAL", "NOMINAL", "NONE"
+            elif percent <= 0.5:
+                status, mode, power, cooling, fault = "FAILED", "STANDBY", "OFF", "SHUTDOWN", "TRANSMITTER_FAIL"
+            else:
+                status, mode, power, cooling, fault = "DEGRADED", "DEGRADED_SEARCH", "REDUCED", "ELEVATED", "RANGE_LIMIT"
+            rows.append(
+                {
+                    "time_seconds": float(instant),
+                    "timestamp": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "ship_id": ship["ship_id"],
+                    "ship_name": ship["ship_name"],
+                    "ship_type": ship["ship_type"],
+                    "latitude": ship_lat,
+                    "longitude": ship_lon,
+                    "current_heading": heading,
+                    "radar_status": status,
+                    "capacity_percent": percent,
+                    "full_range_km": ship["full_range_km"],
+                    "max_range_km": ship["full_range_km"],
+                    "effective_range_km": ship["full_range_km"] * scale,
+                    "num_detections": round(ship["num_detections"] * scale),
+                    "avg_snr_db": ship["avg_snr_db"] * (0.35 + 0.65 * scale),
+                    "elevation_coverage_deg": ship["elevation_coverage_deg"] * scale,
+                    "azimuth_coverage_deg": ship["azimuth_coverage_deg"] * scale,
+                    "track_quality": percent,
+                    "radar_mode": mode,
+                    # Threat drifts from 030° toward 055° over the run. Same value on every ship.
+                    "threat_bearing_deg": 30.0 + 25.0 * (float(instant) / duration),
+                    "threat_range_km": 160.0,
+                    "threat_priority": 1,
+                    "power_status": power,
+                    "cooling_status": cooling,
+                    "last_maintenance": "2026-10-15",
+                    "fault_code": fault,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def load_snooze(path: Path) -> pd.DataFrame:
+    """Load snooze_cruise.csv, creating the sample track if the file is absent."""
+    rewrite = False
+    if not path.is_file():
+        rewrite = True
     else:
-        mode, power, cooling, fault = "DEGRADED_SEARCH", "REDUCED", "ELEVATED", "RANGE_LIMIT"
+        frame = pd.read_csv(path)
+        if "threat_bearing_deg" not in frame.columns:
+            print(f"{path} has no threat_bearing_deg column. Writing a fresh sample.")
+            rewrite = True
+    if rewrite:
+        frame = build_snooze_cruise()
+        frame.to_csv(path, index=False)
+        print(f"Wrote sample cruise track to {path}")
+    required = [
+        "time_seconds",
+        "ship_id",
+        "ship_name",
+        "ship_type",
+        "latitude",
+        "longitude",
+        "current_heading",
+        "capacity_percent",
+        "threat_bearing_deg",
+        "num_detections",
+        "avg_snr_db",
+        "elevation_coverage_deg",
+        "azimuth_coverage_deg",
+        "track_quality",
+    ]
+    missing = [name for name in required if name not in frame.columns]
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"{path} is missing columns: {joined}")
+    if "full_range_km" not in frame.columns:
+        if "max_range_km" not in frame.columns:
+            raise ValueError(f"{path} needs full_range_km or max_range_km")
+        frame["full_range_km"] = frame["max_range_km"]
+    frame["ship_id"] = frame["ship_id"].astype(str).str.strip()
+    for column in (
+        "time_seconds",
+        "latitude",
+        "longitude",
+        "current_heading",
+        "capacity_percent",
+        "threat_bearing_deg",
+        "full_range_km",
+        "num_detections",
+        "avg_snr_db",
+        "elevation_coverage_deg",
+        "azimuth_coverage_deg",
+        "track_quality",
+    ):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if frame["time_seconds"].isna().any() or frame["latitude"].isna().any():
+        raise ValueError(f"{path} has a blank time or position")
+    for optional, default in (
+        ("radar_status", "OK"),
+        ("radar_mode", "SEARCH"),
+        ("power_status", "NOMINAL"),
+        ("cooling_status", "NOMINAL"),
+        ("last_maintenance", "2026-10-15"),
+        ("fault_code", "NONE"),
+    ):
+        if optional not in frame.columns:
+            frame[optional] = default
+    return frame.sort_values(["ship_id", "time_seconds"]).reset_index(drop=True)
+
+
+def _bracket(group: pd.DataFrame, elapsed_s: float) -> tuple[pd.Series, pd.Series, float]:
+    """Rows on either side of elapsed_s and the blend fraction toward the later one."""
+    times = group["time_seconds"].to_numpy(dtype=float)
+    if elapsed_s <= times[0]:
+        row = group.iloc[0]
+        return row, row, 0.0
+    if elapsed_s >= times[-1]:
+        row = group.iloc[-1]
+        return row, row, 0.0
+    high = int(np.searchsorted(times, elapsed_s, side="left"))
+    if abs(times[high] - elapsed_s) <= 1e-6:
+        row = group.iloc[high]
+        return row, row, 0.0
+    low = high - 1
+    span = float(times[high] - times[low])
+    fraction = 0.0 if span <= 0 else (elapsed_s - float(times[low])) / span
+    return group.iloc[low], group.iloc[high], fraction
+
+
+def _scheduled_capacity(ship_id: str, elapsed_s: float) -> float:
+    """Capacity written into the sample snooze_cruise.csv. Edit that file to change it."""
+    if ship_id == "DDG-101" and elapsed_s >= 12:
+        return 60.0
+    if ship_id == "CG-58" and elapsed_s >= 32:
+        return 0.0
+    if ship_id == "DDG-112" and elapsed_s >= 52:
+        return 40.0
+    return 100.0
+
+
+def snapshot_at(group: pd.DataFrame, elapsed_s: float) -> dict:
+    """Interpolate position. Radar values step to the latest row at or before this time."""
+    low, high, fraction = _bracket(group, elapsed_s)
+    percent = float(low["capacity_percent"])
+    full_range = float(low["full_range_km"])
+    if "effective_range_km" in low.index and pd.notna(low["effective_range_km"]):
+        effective = float(low["effective_range_km"])
+    else:
+        effective = full_range * percent / 100.0
+    stamp = SCENARIO_START + pd.Timedelta(seconds=float(elapsed_s))
     return {
-        "timestamp": timestamp,
-        "ship_id": ship["ship_id"],
-        "ship_name": ship["ship_name"],
-        "ship_type": ship["ship_type"],
-        "latitude": ship["latitude"],
-        "longitude": ship["longitude"],
-        "current_heading": ship["current_heading"],
-        "radar_status": status_override or _status_name(percent),
+        "timestamp": stamp,
+        "ship_id": str(low["ship_id"]),
+        "ship_name": str(low["ship_name"]),
+        "ship_type": str(low["ship_type"]),
+        "latitude": _lerp(float(low["latitude"]), float(high["latitude"]), fraction),
+        "longitude": _lerp(float(low["longitude"]), float(high["longitude"]), fraction),
+        "current_heading": _lerp_heading(float(low["current_heading"]), float(high["current_heading"]), fraction),
+        "radar_status": str(low["radar_status"]),
         "capacity_percent": percent,
-        "full_range_km": ship["full_range_km"],
-        "max_range_km": ship["full_range_km"],
-        "effective_range_km": ship["full_range_km"] * fraction,
-        "num_detections": round(ship["num_detections"] * fraction),
-        "avg_snr_db": ship["avg_snr_db"] * (0.35 + 0.65 * fraction),
-        "elevation_coverage_deg": ship["elevation_coverage_deg"] * fraction,
-        "azimuth_coverage_deg": ship["azimuth_coverage_deg"] * fraction,
-        "track_quality": percent,
-        "radar_mode": mode,
-        "power_status": power,
-        "cooling_status": cooling,
-        "last_maintenance": "2026-10-15",
-        "fault_code": fault,
+        "full_range_km": full_range,
+        "max_range_km": full_range,
+        "effective_range_km": float(effective),
+        "num_detections": float(low["num_detections"]),
+        "avg_snr_db": float(low["avg_snr_db"]),
+        "elevation_coverage_deg": float(low["elevation_coverage_deg"]),
+        "azimuth_coverage_deg": float(low["azimuth_coverage_deg"]),
+        "track_quality": float(low["track_quality"]),
+        "radar_mode": str(low["radar_mode"]),
+        "power_status": str(low["power_status"]),
+        "cooling_status": str(low["cooling_status"]),
+        "last_maintenance": str(low["last_maintenance"]),
+        "fault_code": str(low["fault_code"]),
+        "threat_bearing_deg": _lerp_heading(
+            float(low["threat_bearing_deg"]), float(high["threat_bearing_deg"]), fraction
+        ),
+        "threat_range_km": float(low["threat_range_km"]) if "threat_range_km" in low.index else None,
+        "threat_priority": float(low["threat_priority"]) if "threat_priority" in low.index else None,
     }
 
 
 def print_ship_state(state: pd.DataFrame) -> None:
     """Print the detailed radar row for every ship on this update."""
     print("Ship state")
+    first = state.iloc[0]
+    threat_range = getattr(first, "threat_range_km", None)
+    span = f", range {float(threat_range):.0f} km" if threat_range is not None and pd.notna(threat_range) else ""
+    print(f"  Threat axis: {float(first.threat_bearing_deg):.0f}° true{span}")
     for row in state.sort_values("ship_id").itertuples(index=False):
         print(
             f"  {row.ship_id} {row.ship_name} ({row.ship_type})  {row.radar_status}"
@@ -1297,32 +1668,33 @@ def print_ship_state(state: pd.DataFrame) -> None:
 
 
 class Scenario:
-    """In-memory strike group whose radar rows grow as the clock advances."""
+    """Playback of snooze_cruise.csv. Positions move; capacity comes from that file."""
 
-    def __init__(self, timeline: list[dict] | None = None) -> None:
+    def __init__(self, cruise: pd.DataFrame) -> None:
+        self.cruise = cruise
+        self.groups = {
+            ship_id: group.sort_values("time_seconds").reset_index(drop=True)
+            for ship_id, group in cruise.groupby("ship_id", sort=False)
+        }
         self.elapsed_s = 0.0
-        self.timeline = list(timeline or [])
-        self.history: list[dict] = []
-        self.record()
 
     def clock(self) -> pd.Timestamp:
         return SCENARIO_START + pd.Timedelta(seconds=self.elapsed_s)
 
-    def record(self) -> None:
-        """Append one detailed sample per ship at the current scenario time."""
-        stamp = self.clock()
-        for ship in FLEET:
-            self.history.append(ship_snapshot(ship, self.elapsed_s, stamp, self.timeline))
-
     def advance(self, seconds: float) -> None:
         self.elapsed_s += seconds
-        self.record()
 
     def current_state(self) -> pd.DataFrame:
-        return pd.DataFrame(self.history[-len(FLEET) :])
+        rows = [snapshot_at(group, self.elapsed_s) for group in self.groups.values()]
+        return pd.DataFrame(rows)
 
     def radar_frame(self) -> pd.DataFrame:
-        return pd.DataFrame(self.history)
+        """Rows at or before the clock, so the loss time is the file's own timestamp."""
+        past = self.cruise.loc[self.cruise["time_seconds"] <= self.elapsed_s + 1e-6].copy()
+        past["timestamp"] = SCENARIO_START + pd.to_timedelta(past["time_seconds"], unit="s")
+        if "max_range_km" not in past.columns:
+            past["max_range_km"] = past["full_range_km"]
+        return past
 
     def location_frame(self) -> pd.DataFrame:
         state = self.current_state()
@@ -1331,21 +1703,30 @@ class Scenario:
         ].copy()
 
 
-def timeline_text(timeline: list[dict]) -> str:
-    """One line describing the scheduled capacity changes."""
-    if not timeline:
-        return "none (all radars remain at 100%)"
-    parts = [
-        f"T+{event['time_seconds']:.0f}s {event['ship_id']} → {event['capacity_percent']:.0f}%"
-        for event in timeline
-    ]
-    return ", ".join(parts)
+def schedule_text(cruise: pd.DataFrame) -> str:
+    """Describe capacity changes stored in snooze_cruise.csv."""
+    changes: list[tuple[float, str, float]] = []
+    for ship_id, group in cruise.groupby("ship_id"):
+        ordered = group.sort_values("time_seconds")
+        previous = None
+        for row in ordered.itertuples(index=False):
+            percent = float(row.capacity_percent)
+            if previous is None:
+                previous = percent
+                continue
+            if abs(percent - previous) > 0.5:
+                changes.append((float(row.time_seconds), str(ship_id), percent))
+                previous = percent
+    if not changes:
+        return "no capacity changes (every stored row is steady)"
+    changes.sort()
+    return ", ".join(f"T+{instant:.0f}s {ship_id} → {percent:.0f}%" for instant, ship_id, percent in changes)
 
 
 def run_monitor(
     interval: float,
     total_runtime: float,
-    timeline: list[dict],
+    cruise: pd.DataFrame,
     max_cycles: int | None = None,
 ) -> int:
     """Redraw the strike group until the runtime limit or Ctrl+C."""
@@ -1355,13 +1736,14 @@ def run_monitor(
     updates = max(1, int(total_runtime / interval))
     if max_cycles is not None:
         updates = max(1, max_cycles)
-    scenario = Scenario(timeline)
+    scenario = Scenario(cruise)
     plt.ion()
     print(
         f"Live radar monitor. Update every {interval:g} s. "
         f"Stops after {updates} update(s), {total_runtime:g} s. Ctrl+C to stop early."
     )
-    print(f"Timeline: {timeline_text(timeline)}.")
+    print(f"Data file: {SNOOZE_FILE}")
+    print(f"Schedule in file: {schedule_text(cruise)}.")
     try:
         for cycle in range(updates):
             remaining = max(0.0, total_runtime - cycle * interval)
@@ -1369,19 +1751,27 @@ def run_monitor(
             stamp = scenario.clock()
             state = scenario.current_state()
             state.to_csv(LIVE_STATE_FIGURE, index=False)
+            threat = float(state["threat_bearing_deg"].iloc[0])
+            threat_range = state["threat_range_km"].iloc[0] if "threat_range_km" in state.columns else None
             title = (
                 f"Carrier Strike Group radar status — "
                 f"T+{scenario.elapsed_s:.0f} s ({stamp.strftime('%H:%M:%S')} UTC)"
-                f" — {remaining:.0f} s left"
+                f" — {remaining:.0f} s left — threat {threat:.0f}°"
             )
             print()
             print(
                 f"--- {stamp.strftime('%Y-%m-%d %H:%M:%S UTC')}  |  "
                 f"simulation T+{scenario.elapsed_s:.0f} s  |  "
-                f"{remaining:.0f} s remaining ---"
+                f"{remaining:.0f} s remaining  |  threat {threat:.0f}° ---"
             )
             print_ship_state(state)
-            analyze_frames(scenario.radar_frame(), scenario.location_frame(), title=title)
+            analyze_frames(
+                scenario.radar_frame(),
+                scenario.location_frame(),
+                title=title,
+                threat_bearing=threat,
+                threat_range_km=None if threat_range is None or pd.isna(threat_range) else float(threat_range),
+            )
             plt.show(block=False)
             plt.pause(0.05)
             if cycle + 1 >= updates:
@@ -1430,14 +1820,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional cap on the number of updates. Default is runtime divided by interval.",
     )
     parser.add_argument(
-        "--timeline",
-        default=None,
-        help="Degradation CSV. Default: radar_timeline.csv when that file exists.",
-    )
-    parser.add_argument(
-        "--no-timeline",
-        action="store_true",
-        help="Ignore any timeline file and keep every radar at 100 percent.",
+        "--snooze",
+        default=str(SNOOZE_FILE),
+        help="Cruise file with positions, radar metrics, and the capacity schedule.",
     )
     parser.add_argument(
         "files",
@@ -1453,18 +1838,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Error: --interval and --runtime must be positive.", file=sys.stderr)
         return 1
     try:
-        if args.no_timeline:
-            timeline: list[dict] = []
-            print("No timeline file. All radars stay at 100% capacity.")
-        elif args.timeline is None and not TIMELINE_FILE.is_file():
-            timeline = []
-            print(f"No timeline file at {TIMELINE_FILE}. All radars stay at 100% capacity.")
-        else:
-            timeline = load_timeline(Path(args.timeline) if args.timeline else TIMELINE_FILE)
+        cruise = load_snooze(Path(args.snooze))
     except (FileNotFoundError, ValueError, pd.errors.ParserError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    return run_monitor(args.interval, args.runtime, timeline, args.cycles)
+    return run_monitor(args.interval, args.runtime, cruise, args.cycles)
 
 
 if __name__ == "__main__":
