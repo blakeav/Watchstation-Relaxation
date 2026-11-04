@@ -1,0 +1,4 @@
+time_seconds,ship_id,new_capacity_percent,new_radar_status
+12,DDG-101,60,DEGRADED
+32,CG-58,0,FAILED
+52,DDG-112,40,DEGRADED
