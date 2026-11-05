@@ -9,6 +9,8 @@ Example usage
 -------------
     python3 analyze_radar.py
     python3 analyze_radar.py --interval 2 --runtime 80
+    python3 analyze_radar.py spectrum
+    python3 analyze_radar.py serve
     python3 analyze_radar.py --once radar_performance.csv ship_locations.csv
 
     python3 analyze_radar.py weather --lat 36.85 --lon -76.29
@@ -32,6 +34,8 @@ snooze_cruise.csv is the only live data file. One row per ship per time step:
     solar_flare_class, weather_source
     jammer_type, sjr_db, jammer_bearing_deg (or bearing_deg)
     erp_kw, atmospheric_ducting, optimal_action
+    hit_type, power_surge_volts, cooling_loop_integrity
+    face_damage_pct, modules_offline, casrep_category
     power_status, cooling_status, last_maintenance, fault_code
 
 CASREP texts are also saved under casreps/. capacity_percent and radar_status
@@ -40,7 +44,12 @@ axis from stations at least 25 degrees off that axis, stay in the water, and
 limit time spent inside any storm within 60 nautical miles of the carrier.
 A CASREP names the radar and the relative sector that is degraded. A course
 may be a turn in place, or a move followed by a turn, whichever restores
-more coverage with less disruption.
+more coverage with less disruption. Radar frequency advice reads the same
+file: each ship gets a channel outside the jammer notch, and a failed radar
+is told not to radiate. A station inside the jammer lobe is moved off that
+bearing when a water course still meets the threat and storm limits. The
+spectrum page is only the frequency table. The map keeps the capacity note
+and the best-course note.
 
 The 2-second loop does not call government weather APIs. Those services are
 the weather, monitor, and advise commands, and monitor will not poll faster
@@ -3467,6 +3476,140 @@ def _station_in_water(
     return best
 
 
+def _in_spectrum_lobe(east: float, north: float, spectrum: dict | None) -> bool:
+    """True when this station sits in the jammer lobe inside the conflict range."""
+    if not spectrum or spectrum.get("bearing") is None:
+        return False
+    distance = math.hypot(east, north)
+    if distance < 0.2 or distance > float(spectrum["conflict_range_km"]):
+        return False
+    return wrap_delta(bearing_deg(east, north), float(spectrum["bearing"])) <= float(spectrum["half_deg"])
+
+
+def _station_allowed(
+    east: float,
+    north: float,
+    current_east: float,
+    current_north: float,
+    origin_lat: float,
+    origin_lon: float,
+    threat_bearing: float | None,
+    storms: list[dict],
+) -> bool:
+    """Water, off the threat axis, and outside storm disks."""
+    if storms and _inside_storm(east, north, storms) is not None:
+        return False
+    if not _track_in_water(current_east, current_north, east, north, origin_lat, origin_lon):
+        return False
+    travel = float(np.hypot(east - current_east, north - current_north))
+    if threat_bearing is not None and travel > 0.5:
+        course = bearing_deg(east - current_east, north - current_north)
+        bearing = bearing_deg(east, north)
+        if wrap_delta(bearing, threat_bearing) < THREAT_EXCLUSION_DEG - 0.1:
+            return False
+        if not _heading_clear(course, threat_bearing):
+            return False
+    return True
+
+
+def _avoid_spectrum(
+    station_east: float,
+    station_north: float,
+    current_east: float,
+    current_north: float,
+    origin_lat: float,
+    origin_lon: float,
+    threat_bearing: float | None,
+    storms: list[dict],
+    spectrum: dict | None,
+) -> tuple[float, float, bool]:
+    """Slide a station out of the jammer lobe when another legal point exists."""
+    if spectrum is None or not _in_spectrum_lobe(station_east, station_north, spectrum):
+        return station_east, station_north, False
+    base_bearing = bearing_deg(station_east, station_north)
+    base_range = float(np.hypot(station_east, station_north))
+    jammer_bearing = float(spectrum["bearing"])
+    side = (base_bearing - jammer_bearing + 180.0) % 360.0 - 180.0
+    first_sign = 1.0 if side >= 0 else -1.0
+    options: list[tuple] = []
+    ranges = [base_range, max(6.0, base_range - 4.0), base_range + 4.0, float(spectrum["conflict_range_km"]) + 3.0]
+    for step in range(1, 10):
+        for sign in (first_sign, -first_sign):
+            bearing = (jammer_bearing + sign * (float(spectrum["half_deg"]) + 6.0 * step)) % 360.0
+            for range_km in ranges:
+                east, north = point_at(bearing, range_km)
+                if _in_spectrum_lobe(east, north, spectrum):
+                    continue
+                if not _station_allowed(
+                    east, north, current_east, current_north, origin_lat, origin_lon, threat_bearing, storms
+                ):
+                    continue
+                travel = float(np.hypot(east - current_east, north - current_north))
+                options.append((wrap_delta(bearing, base_bearing), abs(range_km - base_range), travel, east, north))
+    if not options:
+        return station_east, station_north, False
+    options.sort()
+    return options[0][3], options[0][4], True
+
+
+def _spectrum_conflicts(
+    moves: list[dict],
+    origin_lat: float,
+    origin_lon: float,
+    spectrum: dict | None,
+) -> int:
+    if not spectrum:
+        return 0
+    count = 0
+    for move in moves:
+        if move.get("role") != "escort":
+            continue
+        east, north = to_xy(move["station_latitude"], move["station_longitude"], origin_lat, origin_lon)
+        if _in_spectrum_lobe(east, north, spectrum):
+            count += 1
+    return count
+
+
+def _forbidden_emitters(moves: list[dict], spectrum: dict | None) -> int:
+    notch = None if spectrum is None else spectrum.get("notch")
+    if not notch:
+        return 0
+    return sum(
+        1
+        for move in moves
+        if move.get("frequency_mhz") is not None and abs(float(move["frequency_mhz"]) - notch[0]) <= notch[1]
+    )
+
+
+def _close_emitters(moves: list[dict], origin_lat: float, origin_lon: float) -> int:
+    """Escorts whose channels are within 50 MHz and whose stations are within 6 km."""
+    escorts = [move for move in moves if move.get("role") == "escort" and move.get("frequency_mhz") is not None]
+    pairs = 0
+    for left, right in itertools.combinations(escorts, 2):
+        if abs(float(left["frequency_mhz"]) - float(right["frequency_mhz"])) > 50:
+            continue
+        left_east, left_north = to_xy(left["station_latitude"], left["station_longitude"], origin_lat, origin_lon)
+        right_east, right_north = to_xy(right["station_latitude"], right["station_longitude"], origin_lat, origin_lon)
+        if math.hypot(left_east - right_east, left_north - right_north) <= 6.0:
+            pairs += 1
+    return pairs
+
+
+def _spectrum_note(spectrum: dict | None) -> str:
+    """Short rationale clause when the jammer notch or casualty row changes a course."""
+    if not spectrum or spectrum.get("bearing") is None or not spectrum.get("notch"):
+        return ""
+    center, half = spectrum["notch"]
+    note = (
+        f"Spectrum: the jammer denies {center:.0f} ± {half:.0f} MHz "
+        f"inside {spectrum['conflict_range_km']:.0f} km of {spectrum['bearing']:.0f}°. "
+        f"Stations in that lobe were moved when a water course still cleared the threat."
+    )
+    if spectrum.get("casualty_note"):
+        note += " " + spectrum["casualty_note"]
+    return note
+
+
 def _heading_clear(heading: float, threat: float, exclusion: float = THREAT_EXCLUSION_DEG) -> bool:
     """True when a course does not point along the threat vector."""
     return wrap_delta(heading, threat) >= exclusion - 0.1
@@ -3671,6 +3814,7 @@ def _build_plan(
     turn_only: bool = False,
     keep_heading: bool = False,
     jammer: dict | None = None,
+    spectrum: dict | None = None,
 ) -> dict:
     """One course set: a station for every healthy escort, plus coverage numbers."""
     storms = storms or []
@@ -3754,6 +3898,27 @@ def _build_plan(
                 travel = 0.0
                 if float(np.hypot(current_east, current_north)) > 0.1:
                     station_bearing = bearing_deg(current_east, current_north)
+            station_east, station_north, spectrum_shifted = _avoid_spectrum(
+                station_east,
+                station_north,
+                current_east,
+                current_north,
+                origin_lat,
+                origin_lon,
+                threat_bearing,
+                storms,
+                spectrum,
+            )
+            course = bearing_deg(station_east - current_east, station_north - current_north)
+            travel = float(np.hypot(station_east - current_east, station_north - current_north))
+            station_bearing = bearing_deg(station_east, station_north)
+            if travel < 0.5:
+                station_east, station_north = current_east, current_north
+                travel = 0.0
+                if float(np.hypot(current_east, current_north)) > 0.1:
+                    station_bearing = bearing_deg(current_east, current_north)
+        else:
+            spectrum_shifted = False
         if travel < 0.5 and escort["heading"] is not None and threat_bearing is None and not turn_only:
             course = escort["heading"]
         if turn_only:
@@ -3800,6 +3965,8 @@ def _build_plan(
                 "station_longitude": longitude,
                 "travel_km": travel,
                 "role": "escort",
+                "spectrum_shifted": spectrum_shifted,
+                "frequency_mhz": None if spectrum is None else (spectrum["by_ship"].get(escort["ship_id"]) or {}).get("frequency_mhz"),
             }
         )
         station = (station_east, station_north)
@@ -3933,6 +4100,9 @@ def _build_plan(
         - 15.0 * storm_hours
         - 8.0 * _jammed_face_penalty(moves, jammer, threat_bearing)
         - 80.0 * _land_hits(moves, origin_lat, origin_lon)
+        - 10.0 * _spectrum_conflicts(moves, origin_lat, origin_lon, spectrum)
+        - 6.0 * _forbidden_emitters(moves, spectrum)
+        - 4.0 * _close_emitters(moves, origin_lat, origin_lon)
     )
 
     return {
@@ -3953,6 +4123,10 @@ def _build_plan(
         "storm_count": len(storms),
         "outer_range_km": outer_range,
         "score": score,
+        "spectrum_shifts": sum(1 for move in moves if move.get("spectrum_shifted")),
+        "spectrum_conflicts": _spectrum_conflicts(moves, origin_lat, origin_lon, spectrum),
+        "forbidden_count": _forbidden_emitters(moves, spectrum),
+        "emitter_pairs": _close_emitters(moves, origin_lat, origin_lon),
         "positions": screen_positions,
         "reach": screen_reach,
     }
@@ -3965,6 +4139,7 @@ def recommend_courses(
     threat_bearing: float | None = None,
     weather_report: pd.DataFrame | None = None,
     jammer: dict | None = None,
+    spectrum: dict | None = None,
 ) -> tuple[list[dict], str, float]:
     """Three stationing plans ranked Best / Acceptable / Fallback.
 
@@ -4070,6 +4245,7 @@ def recommend_courses(
             threat_bearing,
             storms,
             jammer=jammer,
+            spectrum=spectrum,
         )
         for name, rationale, bearings, station_range in templates
     ]
@@ -4095,6 +4271,7 @@ def recommend_courses(
             storms,
             turn_only=True,
             jammer=jammer,
+            spectrum=spectrum,
         )
     )
     baseline = _build_plan(
@@ -4114,6 +4291,7 @@ def recommend_courses(
         turn_only=True,
         keep_heading=True,
         jammer=jammer,
+        spectrum=spectrum,
     )
     if jammer is not None:
         jammer_note = (
@@ -4130,15 +4308,23 @@ def recommend_courses(
                 f"SJR {jammer['sjr']:.1f} dB"
             )
     water_note = " Stations and the tracks between them stay in the water."
+    spectrum_note = _spectrum_note(spectrum)
     for plan in plans:
         if water_note not in plan["rationale"]:
             plan["rationale"] = plan["rationale"] + water_note
+        if spectrum_note and (
+            plan.get("spectrum_shifts") or plan.get("spectrum_conflicts") or plan.get("forbidden_count") or plan.get("emitter_pairs")
+        ):
+            plan["rationale"] = plan["rationale"] + " " + spectrum_note
+            plan["spectrum_text"] = spectrum_note
         plan["coverage_gain"] = plan["threat_pct"] - baseline["threat_pct"]
     plans.sort(key=lambda plan: plan["score"], reverse=True)
     turn_plan = next(plan for plan in plans if plan.get("turn_only"))
     move_plans = [plan for plan in plans if not plan.get("turn_only")]
     if move_plans and turn_plan["threat_pct"] + 0.5 >= max(plan["threat_pct"] for plan in move_plans):
-        plans = [turn_plan] + [plan for plan in plans if plan is not turn_plan]
+        clearest_move = min(plan.get("spectrum_conflicts", 0) for plan in move_plans)
+        if turn_plan.get("spectrum_conflicts", 0) <= clearest_move:
+            plans = [turn_plan] + [plan for plan in plans if plan is not turn_plan]
     plans = plans[:3]
     for index, plan in enumerate(plans):
         plan["rank"] = index + 1
@@ -4334,6 +4520,8 @@ def _course_note(report: pd.DataFrame, plans: list[dict]) -> str:
         lines.append(f"Storm time {best['storm_hours']:.2f} h within {STORM_WATCH_NM:.0f} nm")
     if best.get("jammer_text"):
         lines.append(best["jammer_text"])
+    if best.get("spectrum_text"):
+        lines.append(best["spectrum_text"])
     listed: set[str] = set()
     for move in best["moves"]:
         listed.add(move["ship_id"])
@@ -4580,6 +4768,7 @@ def analyze_frames(
     threat_bearing: float | None = None,
     threat_range_km: float | None = None,
     jammer: dict | None = None,
+    spectrum: dict | None = None,
 ) -> None:
     """Run the capacity report, course ranking, and both figures for one snapshot."""
     report = attach_locations(assess_capacity(radar, locations), locations)
@@ -4592,7 +4781,7 @@ def analyze_frames(
         return
 
     plans, datum_label, outer_range = recommend_courses(
-        locations, ranges, capacity, threat_bearing=threat_bearing, weather_report=report, jammer=jammer
+        locations, ranges, capacity, threat_bearing=threat_bearing, weather_report=report, jammer=jammer, spectrum=spectrum
     )
     print_recommendations(plans, datum_label, outer_range, capacity, ranges)
     plot_status(locations, report, plans, STATUS_FIGURE, title=title, threat_bearing=threat_bearing)
@@ -5235,6 +5424,9 @@ def load_snooze(path: Path) -> pd.DataFrame:
             frame["jammer_type"].notna()
             & (kind.eq("jammer") if "record_kind" in frame.columns else frame["latitude"].isna())
         ].copy()
+    casualty_rows = frame.iloc[0:0]
+    if "hit_type" in frame.columns and "record_kind" in frame.columns:
+        casualty_rows = frame.loc[frame["record_kind"].astype(str).eq("radar_casualty")].copy()
     # Jammer and casualty rows in a merged snooze_cruise have no track. The
     # loop uses the strike-group rows, which carry weather and radar fields.
     frame = frame.loc[
@@ -5258,6 +5450,7 @@ def load_snooze(path: Path) -> pd.DataFrame:
             frame[optional] = default
     track = frame.sort_values(["ship_id", "time_seconds"]).reset_index(drop=True)
     track.attrs["jammers"] = jammer_rows.reset_index(drop=True)
+    track.attrs["casualties"] = casualty_rows.reset_index(drop=True)
     return track
 
 
@@ -5344,6 +5537,257 @@ def snapshot_at(group: pd.DataFrame, elapsed_s: float) -> dict:
         ),
         "radar_face": str(low["radar_face"]) if "radar_face" in low.index and pd.notna(low["radar_face"]) else "",
     }
+
+
+# Discrete S-band channels each radar can actually tune. A jammer notch,
+# built from the snooze_cruise jammer row, blocks the channels it covers.
+RADAR_CHANNELS_MHZ = {
+    "AN/SPY-6": (3200, 3300, 3400, 3500),
+    "AN/SPY-1B": (3100, 3200, 3300),
+    "AN/SPY-1D(V)": (3100, 3250, 3400),
+}
+_JAMMER_CENTERS_MHZ = (3100, 3225, 3350, 3475, 3600)
+
+
+def _radar_name(row) -> str:
+    name = str(getattr(row, "radar_nomenclature", "") or "").strip()
+    if name and name.lower() != "nan":
+        return name
+    defaults = {
+        "CVN-78": "AN/SPY-6",
+        "CG-58": "AN/SPY-1B",
+        "DDG-101": "AN/SPY-1D(V)",
+        "DDG-112": "AN/SPY-1D(V)",
+    }
+    return defaults.get(str(row.ship_id), "AN/SPY-1D(V)")
+
+
+def jammer_notch_mhz(jammer: dict | None) -> tuple[float, float] | None:
+    """Center and half-width, in MHz, of the band the jammer denies."""
+    if not jammer:
+        return None
+    center = _JAMMER_CENTERS_MHZ[int(float(jammer["jammer_type"])) % len(_JAMMER_CENTERS_MHZ)]
+    half = 40.0 + min(160.0, float(jammer["erp"]) / 4.0)
+    if jammer.get("ducting"):
+        half *= 1.25
+    if float(jammer["sjr"]) < 0:
+        half *= 1.0 + min(1.0, -float(jammer["sjr"]) / 30.0)
+    return float(center), float(half)
+
+
+def _channel_clear(mhz: float, notch: tuple[float, float] | None) -> bool:
+    if notch is None:
+        return True
+    return abs(mhz - notch[0]) > notch[1]
+
+
+def frequency_advice(
+    state: pd.DataFrame,
+    jammer: dict | None,
+    casualty: dict | None = None,
+) -> list[dict]:
+    """One deconflicted channel per ship that can still radiate.
+
+    Failed radars are not assigned a channel. Every other ship gets a
+    channel its radar can tune that is not already given to another ship
+    and, when one exists, sits outside the jammer notch.
+    """
+    notch = jammer_notch_mhz(jammer)
+    used: set[int] = set()
+    advice: list[dict] = []
+    ordered = state.sort_values("ship_id")
+    for row in ordered.itertuples(index=False):
+        radar = _radar_name(row)
+        channels = RADAR_CHANNELS_MHZ.get(radar, (3100, 3300, 3500))
+        if casualty is not None and float(casualty.get("modules_offline") or 0) >= 4 and len(channels) > 1:
+            channels = channels[:-1]
+        percent = float(row.capacity_percent)
+        if percent <= 0.5:
+            advice.append(
+                {
+                    "ship_id": str(row.ship_id),
+                    "ship_name": str(row.ship_name),
+                    "radar": radar,
+                    "frequency_mhz": None,
+                    "action": "do not radiate",
+                    "reason": f"CASREP leaves {radar} at 0% capacity.",
+                }
+            )
+            continue
+        open_channels = [mhz for mhz in channels if mhz not in used and _channel_clear(mhz, notch)]
+        if open_channels:
+            chosen = open_channels[0]
+            reason = "Clear of the jammer and not used by another ship."
+        else:
+            ranked = sorted(
+                (mhz for mhz in channels if mhz not in used),
+                key=lambda mhz: abs(mhz - notch[0]) if notch else 0.0,
+                reverse=True,
+            )
+            chosen = ranked[0] if ranked else channels[0]
+            reason = "Every clear channel is in use. This is the one farthest from the jammer."
+        if percent < 99.5:
+            reason += f" CASREP leaves {percent:.0f}% on {radar}."
+        used.add(int(chosen))
+        advice.append(
+            {
+                "ship_id": str(row.ship_id),
+                "ship_name": str(row.ship_name),
+                "radar": radar,
+                "frequency_mhz": int(chosen),
+                "action": "tune",
+                "reason": reason,
+            }
+        )
+    return advice
+
+
+def print_frequency_advice(advice: list[dict], jammer: dict | None) -> None:
+    """Text form of the frequency advice. No map panel is drawn for this."""
+    print("Radar frequency advice")
+    notch = jammer_notch_mhz(jammer)
+    if notch is None:
+        print("  No jammer row for this time. Channels are only kept apart.")
+    else:
+        print(
+            f"  Jammer notch {notch[0]:.0f} MHz ± {notch[1]:.0f} MHz"
+            f"  ({jammer['erp']:.0f} kW, SJR {jammer['sjr']:.1f} dB,"
+            f" optimal_action {jammer['action']})"
+        )
+    for item in advice:
+        if item["frequency_mhz"] is None:
+            tuned = "silent"
+        else:
+            tuned = f"{item['frequency_mhz']} MHz"
+        print(f"  {item['ship_id']:<8} {item['radar']:<12} {item['action']:<16} {tuned}")
+        print(f"    {item['reason']}")
+
+
+def spectrum_snapshot(elapsed_s: float, path: Path | None = None) -> dict:
+    """Frequency advice for one scenario time, read from snooze_cruise."""
+    cruise = load_snooze(path or SNOOZE_FILE)
+    scenario = Scenario(cruise)
+    scenario.elapsed_s = min(max(0.0, float(elapsed_s)), float(TOTAL_RUNTIME_SECONDS))
+    state = scenario.current_state()
+    jammer = jammer_at(cruise.attrs.get("jammers"), scenario.elapsed_s)
+    casualty = casualty_at(cruise.attrs.get("casualties"), scenario.elapsed_s)
+    advice = frequency_advice(state, jammer, casualty)
+    notch = jammer_notch_mhz(jammer)
+    return {
+        "elapsed_s": scenario.elapsed_s,
+        "jammer": None
+        if jammer is None
+        else {
+            "bearing_deg": jammer["bearing"],
+            "erp_kw": jammer["erp"],
+            "sjr_db": jammer["sjr"],
+            "ducting": jammer["ducting"],
+            "jammer_type": float(jammer["jammer_type"]),
+            "optimal_action": jammer["action"],
+            "notch_center_mhz": None if notch is None else notch[0],
+            "notch_half_mhz": None if notch is None else notch[1],
+        },
+        "advice": advice,
+    }
+
+
+def render_spectrum_page(elapsed_s: float, path: Path | None = None) -> str:
+    """Spectrum page. The ship-console / alert panel is not part of this page."""
+    payload = spectrum_snapshot(elapsed_s, path)
+    rows = []
+    for item in payload["advice"]:
+        tuned = "silent" if item["frequency_mhz"] is None else f"{item['frequency_mhz']} MHz"
+        rows.append(
+            "<tr>"
+            f"<td>{item['ship_id']}</td>"
+            f"<td>{item['radar']}</td>"
+            f"<td>{item['action']}</td>"
+            f"<td>{tuned}</td>"
+            f"<td>{item['reason']}</td>"
+            "</tr>"
+        )
+    jammer = payload["jammer"]
+    if jammer is None:
+        jammer_line = "No jammer row at this time."
+    else:
+        jammer_line = (
+            f"Jammer {jammer['bearing_deg']:.0f}°  {jammer['erp_kw']:.0f} kW  "
+            f"SJR {jammer['sjr_db']:.1f} dB  notch {jammer['notch_center_mhz']:.0f} MHz"
+        )
+    body = "\n".join(rows)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Spectrum deconfliction</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2rem auto; max-width: 52rem; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }}
+  </style>
+</head>
+<body>
+  <h1>Spectrum deconfliction</h1>
+  <p>T+{payload['elapsed_s']:.0f} s. {jammer_line}</p>
+  <table>
+    <thead><tr><th>Ship</th><th>Radar</th><th>Action</th><th>Channel</th><th>Reason</th></tr></thead>
+    <tbody>
+      {body}
+    </tbody>
+  </table>
+</body>
+</html>
+"""
+
+
+def spectrum_main(argv: list[str] | None = None) -> int:
+    """Print deconflicted radar channels for one scenario time."""
+    parser = argparse.ArgumentParser(description="Radar frequency advice from snooze_cruise.")
+    parser.add_argument("--elapsed", type=float, default=0.0, help="Scenario seconds.")
+    parser.add_argument("--snooze", default=str(SNOOZE_FILE))
+    args = parser.parse_args(argv)
+    payload = spectrum_snapshot(args.elapsed, Path(args.snooze))
+    jammer = None
+    if payload["jammer"] is not None:
+        jammer = {
+            "bearing": payload["jammer"]["bearing_deg"],
+            "erp": payload["jammer"]["erp_kw"],
+            "sjr": payload["jammer"]["sjr_db"],
+            "ducting": payload["jammer"]["ducting"],
+            "jammer_type": payload["jammer"]["jammer_type"],
+            "action": payload["jammer"]["optimal_action"],
+        }
+    print_frequency_advice(payload["advice"], jammer)
+    return 0
+
+
+def serve_main(argv: list[str] | None = None) -> int:
+    """Serve the spectrum page. It does not render a ship-console panel."""
+    parser = argparse.ArgumentParser(description="Serve radar frequency advice.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--snooze", default=str(SNOOZE_FILE))
+    args = parser.parse_args(argv)
+    try:
+        from fastapi import FastAPI, Query
+        from fastapi.responses import HTMLResponse
+        import uvicorn
+    except ImportError:
+        print("Install fastapi and uvicorn to serve the spectrum page.", file=sys.stderr)
+        return 1
+    snooze = Path(args.snooze)
+    app = FastAPI(title="Strike group spectrum")
+
+    @app.get("/", response_class=HTMLResponse)
+    def page(elapsed: float = Query(0.0)) -> str:
+        return render_spectrum_page(elapsed, snooze)
+
+    @app.get("/spectrum")
+    def spectrum(elapsed: float = Query(0.0)) -> dict:
+        return spectrum_snapshot(elapsed, snooze)
+
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
 
 
 def print_ship_state(state: pd.DataFrame) -> None:
@@ -5469,6 +5913,62 @@ def jammer_at(table: pd.DataFrame | None, elapsed_s: float) -> dict | None:
     }
 
 
+def casualty_at(table: pd.DataFrame | None, elapsed_s: float) -> dict | None:
+    """One radar-casualty row for this simulation time.
+
+    Those rows have no ship or clock, so the index follows the 2-second loop.
+    """
+    if table is None or len(table) == 0:
+        return None
+    row = table.iloc[int(elapsed_s / UPDATE_INTERVAL_SECONDS) % len(table)]
+
+    def number(name: str) -> float:
+        if name not in row.index or pd.isna(row[name]):
+            return 0.0
+        return float(row[name])
+
+    return {
+        "hit_type": None if "hit_type" not in row.index or pd.isna(row["hit_type"]) else row["hit_type"],
+        "power_surge_volts": number("power_surge_volts"),
+        "cooling_loop_integrity": number("cooling_loop_integrity"),
+        "face_damage_pct": number("face_damage_pct"),
+        "modules_offline": number("modules_offline"),
+        "casrep_category": int(number("casrep_category")),
+    }
+
+
+def spectrum_context(state: pd.DataFrame, jammer: dict | None, casualty: dict | None) -> dict | None:
+    """Forbidden band, conflict lobe, and the channel assigned to each ship."""
+    if jammer is None and casualty is None:
+        return None
+    advice = frequency_advice(state, jammer, casualty)
+    notch = jammer_notch_mhz(jammer)
+    half = 0.0 if jammer is None else float(jammer["half"])
+    reach = 0.0 if jammer is None else min(40.0, 8.0 + float(jammer["erp"]) / 25.0)
+    casualty_note = ""
+    if casualty is not None and jammer is not None:
+        damage = float(casualty["face_damage_pct"])
+        widened = min(70.0, half * (1.0 + damage / 200.0))
+        if widened > half + 0.5:
+            half = widened
+            casualty_note = f"Face damage {damage:.0f}% widens that lobe."
+        offline = float(casualty["modules_offline"])
+        if offline >= 4:
+            extra = f"{offline:.0f} modules offline drop the top channel."
+            casualty_note = f"{casualty_note} {extra}".strip()
+    if jammer is None:
+        return None
+    return {
+        "bearing": float(jammer["bearing"]),
+        "half_deg": half,
+        "conflict_range_km": reach,
+        "notch": notch,
+        "by_ship": {item["ship_id"]: item for item in advice},
+        "advice": advice,
+        "casualty_note": casualty_note,
+    }
+
+
 def run_monitor(
     interval: float,
     total_runtime: float,
@@ -5484,6 +5984,7 @@ def run_monitor(
         updates = max(1, max_cycles)
     scenario = Scenario(cruise)
     jammers = cruise.attrs.get("jammers")
+    casualties = cruise.attrs.get("casualties")
     plt.ion()
     print(
         f"Live radar monitor. Update every {interval:g} s. "
@@ -5503,6 +6004,7 @@ def run_monitor(
             threat = float(state["threat_bearing_deg"].iloc[0])
             threat_range = state["threat_range_km"].iloc[0] if "threat_range_km" in state.columns else None
             jammer = jammer_at(jammers, scenario.elapsed_s)
+            spectrum = spectrum_context(state, jammer, casualty_at(casualties, scenario.elapsed_s))
             jammer_title = f" — jammer {jammer['bearing']:.0f}°" if jammer else ""
             title = (
                 f"Carrier Strike Group radar status — "
@@ -5538,7 +6040,9 @@ def run_monitor(
                 threat_bearing=threat,
                 threat_range_km=None if threat_range is None or pd.isna(threat_range) else float(threat_range),
                 jammer=jammer,
+                spectrum=spectrum,
             )
+            print_frequency_advice(spectrum["advice"] if spectrum else frequency_advice(state, jammer), jammer)
             plt.show(block=False)
             plt.pause(0.05)
             if cycle + 1 >= updates:
@@ -5621,6 +6125,10 @@ def main(argv: list[str] | None = None) -> int:
         return monitor_main(args[1:])
     if args[:1] == ["advise"]:
         return advise_main(args[1:])
+    if args[:1] == ["spectrum"]:
+        return spectrum_main(args[1:])
+    if args[:1] == ["serve"]:
+        return serve_main(args[1:])
     return radar_main(args)
 
 
