@@ -12,7 +12,13 @@ meteorological services:
 No commercial weather aggregator is used.
 
 The whole program is this one file. Ocean stations, synthesized ships, and the
-forecast checks are included. Copy the file anywhere and run it. Opening it runs a weather scan before any other command:
+forecast checks are included. Copy the file anywhere and run it. Opening it runs a weather scan before any other command.
+
+By default the scan reads the latest latitude and longitude of each ship in
+the track file and reports only the 256 nautical mile radius around those
+positions. Each direction states how many nautical miles from the ships that
+weather occurs. Interfering weather also includes the heading and nautical
+miles to sail until the ships are clear of it. Pass --global-stations to use the fixed ocean list instead.
 
     python snooze_cruise.py
     python snooze_cruise.py monitor
@@ -23,6 +29,7 @@ forecast checks are included. Copy the file anywhere and run it. Opening it runs
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import ssl
@@ -1159,7 +1166,7 @@ def forecast_main(argv: list[str] | None = None) -> int:
     return 0
 
 
-EVENT_RADIUS_NM = 60.0
+EVENT_RADIUS_NM = 256.0
 OVERCAST_PERCENT = 90.0
 FOG_AREA_PERCENT = 50.0
 MEDIUM_DROPLET_G_M3 = 0.05
@@ -1171,6 +1178,12 @@ MET_NORWAY_COMPLETE = (
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_EVENTS = PACKAGE_ROOT / "output" / "weather_events.json"
 DEFAULT_STATUS = PACKAGE_ROOT / "output" / "station_status.json"
+def default_track_path() -> Path:
+    """Track CSV beside this file, or in the user's Downloads folder."""
+    beside_script = Path(__file__).resolve().parent / "snooze_cruise.csv"
+    if beside_script.exists():
+        return beside_script
+    return Path.home() / "Downloads" / "snooze_cruise.csv"
 
 BUILTIN_STATIONS = (
     ("North Sea", 58.0, 1.5),
@@ -1432,7 +1445,7 @@ def solar_event(
         ),
         criterion=(
             "NOAA SWPC radio-blackout scale: M-class is R1 or higher and X-class is R3 or higher. "
-            "The published disk is the 60 nmi ocean sample. Leaving that disk does not leave the sunlit side."
+            "The published disk is the ocean sample radius. Leaving that disk does not leave the sunlit side."
         ),
         source=source,
         valid_time=valid_time.isoformat(),
@@ -1444,8 +1457,32 @@ def solar_event(
 
 
 def distance_nm(lat: float, lon: float, other_lat: float, other_lon: float) -> float:
+    _heading, distance = bearing_nm(lat, lon, other_lat, other_lon)
+    return distance
+
+
+def bearing_nm(lat: float, lon: float, other_lat: float, other_lon: float) -> tuple[int, float]:
+    """Heading and distance from one point to another. Heading 0 is north."""
     east, north = latlon_to_nm(other_lat, other_lon, lat, lon)
-    return math.hypot(east, north)
+    distance = math.hypot(east, north)
+    if distance < 0.05:
+        return 0, 0.0
+    heading = int(round(math.degrees(math.atan2(east, north)))) % 360
+    return heading, distance
+
+
+def compass_point(heading: int) -> str:
+    names = (
+        "north",
+        "northeast",
+        "east",
+        "southeast",
+        "south",
+        "southwest",
+        "west",
+        "northwest",
+    )
+    return names[int((heading % 360) + 22.5) // 45 % 8]
 
 
 def escape_course(events: list[WeatherEvent], lat: float, lon: float) -> tuple[int, float] | None:
@@ -1659,14 +1696,103 @@ def save_status(path: Path, records: dict[str, dict], generated_at: datetime) ->
     temporary.replace(path)
 
 
+def load_track_ships(path: Path) -> list[Ship]:
+    """Latest latitude and longitude for each ship in a track CSV."""
+    latest: dict[str, tuple[tuple[str, str], str, float, float]] = {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if not isinstance(row, dict):
+                continue
+            hull = str(row.get("ship_id") or "").strip()
+            lat_text = row.get("latitude")
+            lon_text = row.get("longitude")
+            if not hull or lat_text in (None, "") or lon_text in (None, ""):
+                continue
+            lat = float(lat_text)
+            lon = float(lon_text)
+            if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                raise ValueError(f"{hull} has a position outside latitude or longitude bounds.")
+            key = (str(row.get("timestamp") or ""), str(row.get("time_seconds") or ""))
+            name = str(row.get("ship_name") or hull).strip() or hull
+            previous = latest.get(hull)
+            if previous is None or key >= previous[0]:
+                latest[hull] = (key, name, lat, lon)
+    if not latest:
+        raise ValueError(f"No ship positions in {path}.")
+    return [Ship(item[1], hull, item[2], item[3]) for hull, item in sorted(latest.items())]
+
+
+def stations_for_ships(ships: list[Ship], radius_nm: float) -> list[Station]:
+    """Sample the center and two rings inside the radius of each ship group."""
+    return [sample for station in _ship_centers(ships, radius_nm) for sample in _ring_samples(station, radius_nm)]
+
+
+def _ship_centers(ships: list[Ship], radius_nm: float) -> list[Station]:
+    clusters: list[list[Ship]] = []
+    for ship in ships:
+        placed = False
+        for cluster in clusters:
+            lat, lon = _cluster_center(cluster)
+            if distance_nm(lat, lon, ship.lat, ship.lon) <= radius_nm:
+                cluster.append(ship)
+                placed = True
+                break
+        if not placed:
+            clusters.append([ship])
+    return [
+        Station(", ".join(ship.hull for ship in cluster), *_cluster_center(cluster))
+        for cluster in clusters
+    ]
+
+
+def _ring_samples(center: Station, radius_nm: float) -> list[Station]:
+    samples = [Station(f"{center.name} center", center.lat, center.lon)]
+    for fraction in (0.5, 0.85):
+        distance = radius_nm * fraction
+        for bearing in range(0, 360, 45):
+            east = distance * math.sin(math.radians(bearing))
+            north = distance * math.cos(math.radians(bearing))
+            lat, lon = nm_to_latlon(east, north, center.lat, center.lon)
+            lon = ((lon + 180.0) % 360.0) - 180.0
+            samples.append(
+                Station(f"{center.name} {compass_point(bearing)} {distance:.0f} nmi", lat, lon)
+            )
+    return samples
+
+
+def _cluster_center(ships: list[Ship]) -> tuple[float, float]:
+    return (
+        sum(ship.lat for ship in ships) / len(ships),
+        sum(ship.lon for ship in ships) / len(ships),
+    )
+
+
+def format_track_positions(ships: list[Ship], radius_nm: float) -> str:
+    lines = [f"Latest track positions, {radius_nm:.0f} nmi radius:"]
+    for ship in ships:
+        lines.append(f"  {ship.hull} {ship.name}, {format_position(ship.lat, ship.lon)}")
+    return "\n".join(lines)
+
+
 def monitor_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Poll NATO and EU government forecasts at ocean stations. "
-            "Write interfering weather as coordinates plus a 60 nmi radius."
+            "Poll NATO and EU government forecasts within 256 nmi of the latest "
+            "ship positions. Write interfering weather with its direction from the ships."
         )
     )
+    parser.add_argument(
+        "--track",
+        type=Path,
+        default=None,
+        help="CSV whose latest latitude and longitude are used for each ship",
+    )
     parser.add_argument("--stations", type=Path, default=None, help="Optional ocean station JSON")
+    parser.add_argument(
+        "--global-stations",
+        action="store_true",
+        help="Scan the fixed ocean list instead of the ship track",
+    )
     parser.add_argument("--events", type=Path, default=DEFAULT_EVENTS, help="Event file for the ship advisor")
     parser.add_argument("--interval", type=int, default=1800, help="Seconds between polls (minimum 60)")
     parser.add_argument("--once", action="store_true", help="Poll one time and exit")
@@ -1689,6 +1815,8 @@ def monitor_main(argv: list[str] | None = None) -> int:
         help="ITU-R P.840 fog water density: 0.05 medium or 0.5 thick",
     )
     args = parser.parse_args(argv)
+    if args.track is None:
+        args.track = default_track_path()
     if not args.once and args.interval < 60:
         parser.error("--interval must be at least 60 seconds so government forecasts are not polled in a tight loop.")
     radar = RadarContext(
@@ -1699,17 +1827,21 @@ def monitor_main(argv: list[str] | None = None) -> int:
         fog_density_g_m3=args.fog_density,
         radius_nm=args.radius_nm,
     )
-    stations = load_stations(args.stations)
-    if args.max_stations > 0:
-        stations = stations[: args.max_stations]
-    if not stations:
-        print("No ocean stations to check.", file=sys.stderr)
-        return 1
-
     while True:
+        try:
+            stations, ships = _monitor_targets(args)
+        except (OSError, ValueError, csv.Error) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if args.max_stations > 0:
+            stations = stations[: args.max_stations]
+        if not stations:
+            print("No positions to check.", file=sys.stderr)
+            return 1
         now = datetime.now(timezone.utc)
+        label = "ship-radius samples" if ships is not None else "ocean stations"
         print(
-            f"{now.strftime('%Y-%m-%d %H:%M')} UTC  checking {len(stations)} ocean stations...",
+            f"{now.strftime('%Y-%m-%d %H:%M')} UTC  checking {len(stations)} {label}...",
             file=sys.stderr,
         )
         previous = load_status(DEFAULT_STATUS) if args.changes_only else {}
@@ -1725,7 +1857,17 @@ def monitor_main(argv: list[str] | None = None) -> int:
             changes = format_status_changes(previous, records)
             print(changes if changes else "NO_STATUS_CHANGE")
         else:
-            print(format_cycle(observations, events, failures, flare_detail, args.events))
+            report = format_cycle(
+                observations,
+                events,
+                failures,
+                flare_detail,
+                args.events,
+                ships=ships,
+            )
+            if ships is not None:
+                report = f"{format_track_positions(ships, radar.radius_nm)}\n{report}"
+            print(report)
         if failures and not observations and args.once:
             return 1
         if args.once:
@@ -1772,6 +1914,17 @@ def advise_main(argv: list[str] | None = None) -> int:
         if args.once:
             return 0
         time.sleep(args.interval)
+
+
+def _monitor_targets(args: argparse.Namespace) -> tuple[list[Station], list[Ship] | None]:
+    if args.stations is not None:
+        return load_stations(args.stations), None
+    if args.global_stations:
+        return load_stations(None), None
+    if not args.track.exists():
+        raise ValueError(f"Ship track not found: {args.track}")
+    ships = load_track_ships(args.track)
+    return stations_for_ships(ships, args.radius_nm), ships
 
 
 def load_stations(path: Path | None) -> list[Station]:
@@ -1956,25 +2109,122 @@ def format_cycle(
     failures: list[str],
     flare_detail: str,
     path: Path,
+    ships: list[Ship] | None = None,
 ) -> str:
     lines = [
         f"Stations read: {len(observations)}. Interference disks: {len(events)}.",
         f"Solar flare: {flare_detail}",
-        *_weather_lines(observations),
     ]
+    if ships:
+        lines.extend(format_direction_miles(ships, observations, events))
+    else:
+        lines.extend(_weather_lines(observations))
     if events:
         lines.append("Interference:")
         for event in events:
+            place = _event_place(event, ships)
             lines.append(
-                f"  {event.phenomenon} is occurring at {event.station}, "
-                f"{format_position(event.lat, event.lon)}, {event.radius_nm:.0f} nmi. {event.detail}"
+                f"  {event.phenomenon} is occurring {place}. {event.detail}"
             )
+    elif ships is not None:
+        lines.append("No sample inside the ship radius is over the radar-interference threshold.")
     else:
         lines.append("No ocean station is over the radar-interference threshold.")
+    if ships and events:
+        lines.extend(format_avoidance(ships, events))
     for failure in failures:
         lines.append(f"Failed: {failure}")
     lines.append(f"Wrote {path}")
     return "\n".join(lines)
+
+
+def format_avoidance(ships: list[Ship], events: list[WeatherEvent]) -> list[str]:
+    """Heading and nautical miles to sail until the ships are clear of interference."""
+    weather = [event for event in events if event.phenomenon != SOLAR]
+    solar = [event for event in events if event.phenomenon == SOLAR]
+    lines = [
+        *_avoidance_lines(ships, weather, solar=False),
+        *_avoidance_lines(ships, solar, solar=True),
+    ]
+    if not lines:
+        return []
+    return ["Course to sail clear:", *lines]
+
+
+def _avoidance_lines(ships: list[Ship], events: list[WeatherEvent], solar: bool) -> list[str]:
+    grouped: dict[tuple[int, float], list[str]] = {}
+    blocked: list[str] = []
+    for ship in ships:
+        if not containing(events, ship.lat, ship.lon):
+            continue
+        if solar:
+            nearest = min(events, key=lambda event: distance_nm(ship.lat, ship.lon, event.lat, event.lon))
+            azimuth = nearest.sun_azimuth_deg if nearest.sun_azimuth_deg is not None else 0.0
+            elevation = nearest.sun_elevation_deg if nearest.sun_elevation_deg is not None else 0.0
+            course = solar_escape(azimuth, elevation)
+        else:
+            course = escape_course(events, ship.lat, ship.lon)
+        if course is None:
+            blocked.append(ship.hull)
+            continue
+        heading, distance = course
+        grouped.setdefault((heading, distance), []).append(ship.hull)
+    lines = []
+    for heading, distance in sorted(grouped):
+        hulls = ", ".join(grouped[(heading, distance)])
+        if solar:
+            lines.append(
+                f"  {hulls}: steer heading {heading:03d} for {distance:.1f} nautical miles "
+                "to put the sun below the horizon."
+            )
+        else:
+            lines.append(
+                f"  {hulls}: steer heading {heading:03d} for {distance:.1f} nautical miles "
+                "to sail around the interfering weather."
+            )
+    for hull in blocked:
+        lines.append(f"  {hull}: no single heading clears every interfering weather disk.")
+    return lines
+
+
+def _event_place(event: WeatherEvent, ships: list[Ship] | None) -> str:
+    position = f"{event.station}, {format_position(event.lat, event.lon)}, {event.radius_nm:.0f} nmi"
+    if not ships:
+        return f"at {position}"
+    relations = [
+        (ship, *bearing_nm(ship.lat, ship.lon, event.lat, event.lon))
+        for ship in ships
+    ]
+    if all(distance < 1.0 for _ship, _heading, distance in relations):
+        return f"at the ships, {position}"
+    if _same_direction(relations):
+        _ship, heading, distance = relations[0]
+        return (
+            f"{distance:.0f} nmi {compass_point(heading)} of the ships, bearing {heading:03d}, {position}"
+        )
+    parts = []
+    for ship, heading, distance in relations:
+        if distance < 1.0:
+            parts.append(f"at {ship.hull}")
+        else:
+            parts.append(
+                f"{distance:.0f} nmi {compass_point(heading)} of {ship.hull}, bearing {heading:03d}"
+            )
+    return f"{'; '.join(parts)}, {position}"
+
+
+def _same_direction(relations: list[tuple[Ship, int, float]]) -> bool:
+    headings = [heading for _ship, heading, _distance in relations]
+    distances = [distance for _ship, _heading, distance in relations]
+    if max(distances) - min(distances) > 20.0:
+        return False
+    base = headings[0]
+    return all(_heading_gap(base, heading) <= 15 for heading in headings)
+
+
+def _heading_gap(left: int, right: int) -> int:
+    gap = abs(left - right) % 360
+    return min(gap, 360 - gap)
 
 
 def _weather_lines(observations: list[Observation]) -> list[str]:
@@ -1986,6 +2236,53 @@ def _weather_lines(observations: list[Observation]) -> list[str]:
     for phenomenon in sorted(groups):
         lines.append(f"  {phenomenon}: {', '.join(groups[phenomenon])}")
     if not groups:
+        lines.append("  no forecast")
+    return lines
+
+
+def format_direction_miles(
+    ships: list[Ship],
+    observations: list[Observation],
+    events: list[WeatherEvent],
+) -> list[str]:
+    """Weather type and distance from the ships along each compass bearing."""
+    if not ships:
+        return []
+    origin_lat = sum(ship.lat for ship in ships) / len(ships)
+    origin_lon = sum(ship.lon for ship in ships) / len(ships)
+    buckets: dict[str, list[tuple[float, str, bool]]] = {}
+    for observation in observations:
+        heading, distance = bearing_nm(origin_lat, origin_lon, observation.lat, observation.lon)
+        key = "at the ships" if distance < 1.0 else compass_point(heading)
+        interfering = any(
+            distance_nm(observation.lat, observation.lon, event.lat, event.lon) < 1.0
+            for event in events
+        )
+        buckets.setdefault(key, []).append((distance, observation.phenomenon, interfering))
+    lines = ["Miles from the ships:"]
+    order = (
+        "at the ships",
+        "north",
+        "northeast",
+        "east",
+        "southeast",
+        "south",
+        "southwest",
+        "west",
+        "northwest",
+    )
+    for key in order:
+        rows = buckets.get(key)
+        if not rows:
+            continue
+        parts = []
+        for distance, phenomenon, interfering in sorted(rows):
+            place = "0 nmi" if distance < 1.0 else f"{distance:.0f} nmi"
+            if interfering:
+                place += ", interfering"
+            parts.append(f"{phenomenon} at {place}")
+        lines.append(f"  {key}: {', '.join(parts)}")
+    if len(lines) == 1:
         lines.append("  no forecast")
     return lines
 
@@ -2257,7 +2554,7 @@ def _demo_event(ship: Ship) -> WeatherEvent:
     return WeatherEvent(
         lat=ship.lat,
         lon=ship.lon,
-        radius_nm=60.0,
+        radius_nm=EVENT_RADIUS_NM,
         phenomenon="snow",
         detail="8.00 mm/h liquid equivalent, demonstration disk, not a live forecast.",
         criterion="Demonstration disk for the alert format.",
