@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CIC Watchstander</title>
+  <link rel="stylesheet" href="css/cic.css">
+</head>
+<body>
+  <div class="cic">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Combat information center</p>
+        <h1>Watchstander</h1>
+      </div>
+      <p class="notice">Training aid. Notional contacts and injects. The live OPTASK LINK and the ship's combat-systems procedure govern the real watch.</p>
+      <div class="top-actions">
+        <p id="zulu" class="zulu">--:--:--Z</p>
+        <button type="button" id="arm-audio">Arm alert tones</button>
+        <a href="index.html">Link COA</a>
+      </div>
+    </header>
+    <div class="workspace">
+      <div class="scopes">
+        <section id="ppi" class="ppi" aria-label="Tactical radar display"></section>
+        <section id="weather" class="weather" aria-label="Weather display"></section>
+      </div>
+      <aside class="side">
+        <section id="link" class="panel"></section>
+        <section id="alerts" class="panel"></section>
+        <section id="coa" class="panel"></section>
+      </aside>
+    </div>
+    <footer class="bottom">
+      <section id="mocks" class="panel"></section>
+      <section id="history" class="panel"></section>
+      <p class="keys">Space acknowledges the top alert. Enter accepts the course of action. 1 through 4 set the radar scale.</p>
+    </footer>
+  </div>
+  <script type="module" src="src/watchstander.js"></script>
+</body>
+</html>
