@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Carrier Strike Group radar monitor with weather attenuation.
 
-The default command redraws the group every 4 seconds and stops after 80
+The default command redraws the group every 2 seconds and stops after 80
 seconds. Ship motion, radar metrics, CASREP capacity, the threat bearing,
-and weather loss all come from one file, snooze_cruise.csv.
+weather loss, and the jammer rows all come from one file, snooze_cruise.csv.
 
 Example usage
 -------------
     python3 analyze_radar.py
-    python3 analyze_radar.py --interval 4 --runtime 80
+    python3 analyze_radar.py --interval 2 --runtime 80
     python3 analyze_radar.py --once radar_performance.csv ship_locations.csv
 
     python3 analyze_radar.py weather --lat 36.85 --lon -76.29
@@ -30,11 +30,17 @@ snooze_cruise.csv is the only live data file. One row per ship per time step:
     weather_phenomenon, weather_rate_mm_h, weather_cloud_percent
     weather_loss_db, weather_bearing_deg, weather_range_factor
     solar_flare_class, weather_source
+    jammer_type, sjr_db, jammer_bearing_deg (or bearing_deg)
+    erp_kw, atmospheric_ducting, optimal_action
     power_status, cooling_status, last_maintenance, fault_code
 
 CASREP texts are also saved under casreps/. capacity_percent and radar_status
 in snooze_cruise are parsed from those messages. Courses cover the threat
-axis from stations at least 25 degrees off that axis.
+axis from stations at least 25 degrees off that axis, and they also limit
+time spent inside any storm within 60 nautical miles of the carrier.
+A CASREP names the radar and the relative sector that is degraded. A course
+may be a turn in place, or a move followed by a turn, whichever restores
+more coverage with less disruption.
 
 The 4-second loop does not call government weather APIs. Those services are
 the weather, monitor, and advise commands, and monitor will not poll faster
@@ -2628,8 +2634,8 @@ TIMELINE_COLUMNS = ["time_seconds", "ship_id", "new_capacity_percent"]
 
 # Wall-clock pause between map updates. The simulated clock advances by the
 # same amount, so the timeline below is in scenario seconds.
-UPDATE_INTERVAL_SECONDS = 4.0
-# The live monitor exits after this many seconds (20 updates at a 4 s interval).
+UPDATE_INTERVAL_SECONDS = 2.0
+# The live monitor exits after this many seconds (40 updates at a 2 s interval).
 TOTAL_RUNTIME_SECONDS = 80.0
 SCENARIO_START = pd.Timestamp("2026-11-04T12:00:00Z")
 
@@ -2705,6 +2711,16 @@ RANK_LABELS = ["Best", "Acceptable", "Fallback"]
 INNER_RANGE_KM = 40.0
 # Stations and courses must stay at least this far from the threat bearing.
 THREAT_EXCLUSION_DEG = 25.0
+# Storms farther than this from the carrier do not change the course ranking.
+STORM_WATCH_NM = 60.0
+# snooze_cruise stores a weather bearing, not a storm center. The disk sits
+# on that bearing, inside 60 nm, with its near edge close to the screen so
+# a station on the storm bearing steps back outside. The carrier is left on
+# datum when the disk does not cover it.
+STORM_CENTER_NM = 25.0
+STORM_RADIUS_NM = 16.0
+# Speed used only to turn a path through a storm into hours.
+STORM_EXIT_SPEED_KT = 20.0
 # Coverage score emphasizes this half-width on either side of the threat axis.
 THREAT_FOCUS_HALF_DEG = 45.0
 AZIMUTH_BINS = 72
@@ -2841,6 +2857,14 @@ def assess_capacity(radar: pd.DataFrame, locations: pd.DataFrame) -> pd.DataFram
             "weather_range_factor",
             "solar_flare_class",
             "weather_source",
+        ):
+            if column in group.columns:
+                record[column] = latest_row[column]
+        for column in (
+            "radar_nomenclature",
+            "blind_sector_start_rel",
+            "blind_sector_end_rel",
+            "radar_face",
         ):
             if column in group.columns:
                 record[column] = latest_row[column]
@@ -3038,20 +3062,74 @@ def gap_text(mask: np.ndarray) -> str:
     return ", ".join(gaps) if gaps else "none"
 
 
+def _blind_width(start: float | None, end: float | None) -> float:
+    """Degrees of arc that a CASREP says are degraded. 0 means the radar is whole."""
+    if start is None or end is None:
+        return 0.0
+    if isinstance(start, float) and math.isnan(start):
+        return 0.0
+    if isinstance(end, float) and math.isnan(end):
+        return 0.0
+    if float(end) >= 359.5 and float(start) <= 0.5:
+        return 360.0
+    return (float(end) - float(start)) % 360.0
+
+
+def _bearing_in_arc(bearing: float, start: float, end: float) -> bool:
+    """True when bearing lies inside the clockwise arc from start to end."""
+    width = (end - start) % 360.0
+    if width < 0.5:
+        return False
+    return ((bearing - start) % 360.0) <= width
+
+
+def _covers_sample(
+    sample_east: float,
+    sample_north: float,
+    east: float,
+    north: float,
+    reach: float,
+    sector: tuple | None,
+    jammer: dict | None = None,
+) -> bool:
+    """True when this radar's remaining range and healthy faces cover the sample."""
+    if reach <= 0:
+        return False
+    bearing = bearing_deg(sample_east - east, sample_north - north)
+    limit = reach
+    # Jamming shortens range only inside the sector around the jammer bearing.
+    if jammer is not None and wrap_delta(bearing, jammer["bearing"]) <= jammer["half"]:
+        limit = reach * float(jammer["factor"])
+    if (sample_east - east) ** 2 + (sample_north - north) ** 2 > limit ** 2:
+        return False
+    if sector is None:
+        return True
+    heading, rel_start, rel_end = sector
+    width = _blind_width(rel_start, rel_end)
+    if width < 0.5:
+        return True
+    if width >= 359.5:
+        return False
+    true_start = (float(heading) + float(rel_start)) % 360.0
+    true_end = (float(heading) + float(rel_end)) % 360.0
+    return not _bearing_in_arc(bearing, true_start, true_end)
+
+
 def ring_coverage(
     positions: list[tuple[float, float]],
     ranges: list[float],
     radius_km: float,
+    sectors: list | None = None,
+    jammer: dict | None = None,
 ) -> tuple[float, str]:
     """Percent of bearings at radius_km that fall inside at least one healthy radar disk."""
     step = 360.0 / AZIMUTH_BINS
     mask = np.zeros(AZIMUTH_BINS, dtype=bool)
+    sectors = sectors or [None] * len(positions)
     for index in range(AZIMUTH_BINS):
         sample_east, sample_north = point_at(index * step, radius_km)
-        for (east, north), reach in zip(positions, ranges):
-            if reach <= 0:
-                continue
-            if (sample_east - east) ** 2 + (sample_north - north) ** 2 <= reach ** 2:
+        for (east, north), reach, sector in zip(positions, ranges, sectors):
+            if _covers_sample(sample_east, sample_north, east, north, reach, sector, jammer):
                 mask[index] = True
                 break
     percent = 100.0 * float(mask.mean())
@@ -3177,18 +3255,21 @@ def _failed_sector_coverage(
     ranges: list[float],
     radius_km: float,
     failed_bearings: list[float],
+    sectors: list | None = None,
+    jammer: dict | None = None,
 ) -> float:
     """Share of the bearings around each failed ship that a healthy radar still covers."""
     if not failed_bearings:
         return 100.0
+    sectors = sectors or [None] * len(positions)
     hits = 0
     total = 0
     for center in failed_bearings:
         for offset in range(-30, 31, 5):
             total += 1
             sample_east, sample_north = point_at((center + offset) % 360.0, radius_km)
-            for (east, north), reach in zip(positions, ranges):
-                if reach > 0 and (sample_east - east) ** 2 + (sample_north - north) ** 2 <= reach ** 2:
+            for (east, north), reach, sector in zip(positions, ranges, sectors):
+                if _covers_sample(sample_east, sample_north, east, north, reach, sector, jammer):
                     hits += 1
                     break
     return 100.0 * hits / total
@@ -3201,6 +3282,83 @@ def _off_threat_axis(bearing: float, threat: float, exclusion: float = THREAT_EX
     delta = (bearing - threat + 180.0) % 360.0 - 180.0
     sign = 1.0 if delta > 0 else -1.0
     return (threat + sign * exclusion) % 360.0
+
+
+def _away_from(threat: float, other: float | None) -> float:
+    """Bearing farthest from the threat and, when given, the jammer."""
+    if other is None:
+        return (threat + 180.0) % 360.0
+    first = (threat + ((other - threat) % 360.0) / 2.0) % 360.0
+    second = (first + 180.0) % 360.0
+
+    def clearance(bearing: float) -> float:
+        return min(wrap_delta(bearing, threat), wrap_delta(bearing, other))
+
+    return first if clearance(first) >= clearance(second) else second
+
+
+def _bow_for_sector(
+    ship: dict,
+    threat: float | None,
+    keep_heading: bool = False,
+    jammer_bearing: float | None = None,
+) -> float:
+    """Bow that puts a healthy face on the threat and a blind face away from the jammer."""
+    current = ship["heading"] if ship.get("heading") is not None else 0.0
+    current = float(current) % 360.0
+    width = _blind_width(ship.get("blind_start"), ship.get("blind_end"))
+    if keep_heading or threat is None or width < 0.5 or width >= 359.5:
+        return current
+    if jammer_bearing is not None:
+        blind_center = (float(ship["blind_start"]) + width / 2.0) % 360.0
+        heading = (_away_from(threat, jammer_bearing) - blind_center) % 360.0
+        true_start = (heading + float(ship["blind_start"])) % 360.0
+        true_end = (heading + float(ship["blind_end"])) % 360.0
+        if not _bearing_in_arc(threat, true_start, true_end):
+            return heading
+    healthy = 360.0 - width
+    center_rel = (float(ship["blind_end"]) + healthy / 2.0) % 360.0
+    return (threat - center_rel) % 360.0
+
+
+def _sector_brought(ship: dict, heading: float, threat: float | None) -> str:
+    """Name the healthy array face the recommended bow points toward the threat."""
+    radar = ship.get("radar_nomenclature") or "radar"
+    width = _blind_width(ship.get("blind_start"), ship.get("blind_end"))
+    if width >= 359.5:
+        return f"{radar} all faces blind"
+    if width < 0.5:
+        return f"{radar} full azimuth"
+    relative = ((threat - heading) % 360.0) if threat is not None else 0.0
+    faces = (("1", 0.0), ("2", 90.0), ("3", 180.0), ("4", 270.0))
+    blind_face = str(ship.get("radar_face") or "")
+
+    def gap(center: float) -> float:
+        delta = abs(relative - center) % 360.0
+        return min(delta, 360.0 - delta)
+
+    healthy = [face for face in faces if face[0] != blind_face]
+    face, center = min(healthy or list(faces), key=lambda item: gap(item[1]))
+    start = (center - 45.0) % 360.0
+    end = (center + 45.0) % 360.0
+    aim = f" on {threat:.0f}°" if threat is not None else ""
+    return f"{radar} face {face} rel {start:.0f}-{end:.0f}{aim}"
+
+
+def _jammed_face_penalty(moves: list[dict], jammer: dict | None, threat: float | None) -> int:
+    """Count ships whose degraded face still points at the jammer or the threat."""
+    if not jammer:
+        return 0
+    penalty = 0
+    for move in moves:
+        center = move.get("blind_true")
+        if center is None:
+            continue
+        near_jammer = wrap_delta(float(center), jammer["bearing"]) < 30.0
+        near_threat = threat is not None and wrap_delta(float(center), threat) < 30.0
+        if near_jammer or near_threat:
+            penalty += 1
+    return penalty
 
 
 def _heading_clear(heading: float, threat: float, exclusion: float = THREAT_EXCLUSION_DEG) -> bool:
@@ -3229,6 +3387,167 @@ def _threat_shoulders(count: int, threat: float, first_offset: float) -> list[fl
     return bearings
 
 
+def _attach_radar_sectors(ships: list[dict], report: pd.DataFrame | None) -> None:
+    """Copy the radar and blind sector parsed from each ship's CASREP."""
+    defaults = {
+        "CVN-78": "AN/SPY-6",
+        "CG-58": "AN/SPY-1B",
+        "DDG-101": "AN/SPY-1D(V)",
+        "DDG-112": "AN/SPY-1D(V)",
+    }
+    info: dict[str, dict] = {}
+    if report is not None and "radar_nomenclature" in getattr(report, "columns", []):
+        for row in report.itertuples(index=False):
+            start = getattr(row, "blind_sector_start_rel", None)
+            end = getattr(row, "blind_sector_end_rel", None)
+            info[str(row.ship_id)] = {
+                "radar_nomenclature": str(getattr(row, "radar_nomenclature", "") or ""),
+                "blind_start": None if start is None or pd.isna(start) else float(start),
+                "blind_end": None if end is None or pd.isna(end) else float(end),
+                "radar_face": str(getattr(row, "radar_face", "") or ""),
+            }
+    for ship in ships:
+        extra = info.get(ship["ship_id"], {})
+        ship["radar_nomenclature"] = extra.get("radar_nomenclature") or defaults.get(ship["ship_id"], "radar")
+        ship["blind_start"] = extra.get("blind_start")
+        ship["blind_end"] = extra.get("blind_end")
+        ship["radar_face"] = extra.get("radar_face", "")
+
+
+def storms_from_report(report: pd.DataFrame | None) -> list[dict]:
+    """Storm disks within 60 nm of the carrier, read from snooze_cruise weather columns.
+
+    Clear air is not a storm. Rain, snow, thunderstorm, and fog on a reported
+    bearing become one disk. The same bearing is not added twice.
+    """
+    if report is None or "weather_phenomenon" not in report.columns or report.empty:
+        return []
+    storms: list[dict] = []
+    seen: set[tuple[str, float]] = set()
+    for row in report.itertuples(index=False):
+        phenomenon = str(getattr(row, "weather_phenomenon", "")).strip().lower()
+        if phenomenon not in {"rain", "snow", "thunderstorm", "fog"}:
+            continue
+        rate = getattr(row, "weather_rate_mm_h", 0.0)
+        rate = 0.0 if rate is None or (isinstance(rate, float) and math.isnan(rate)) else float(rate)
+        if phenomenon != "fog" and rate < 0.1:
+            continue
+        bearing_value = getattr(row, "weather_bearing_deg", None)
+        if bearing_value is None or pd.isna(bearing_value):
+            continue
+        bearing = float(bearing_value) % 360.0
+        key = (phenomenon, round(bearing, 1))
+        if key in seen or STORM_CENTER_NM > STORM_WATCH_NM:
+            continue
+        seen.add(key)
+        east, north = point_at(bearing, STORM_CENTER_NM * NAUTICAL_MILE_KM)
+        storms.append(
+            {
+                "phenomenon": phenomenon,
+                "bearing": bearing,
+                "east_km": east,
+                "north_km": north,
+                "radius_km": STORM_RADIUS_NM * NAUTICAL_MILE_KM,
+                "center_nm": STORM_CENTER_NM,
+                "radius_nm": STORM_RADIUS_NM,
+            }
+        )
+    return storms
+
+
+def _inside_storm(east: float, north: float, storms: list[dict]) -> dict | None:
+    """The storm disk containing this point, if the point is still inside one."""
+    for storm in storms:
+        if (east - storm["east_km"]) ** 2 + (north - storm["north_km"]) ** 2 <= storm["radius_km"] ** 2:
+            return storm
+    return None
+
+
+def _leave_storm(
+    east: float,
+    north: float,
+    current_east: float,
+    current_north: float,
+    storms: list[dict],
+    threat_bearing: float | None,
+) -> tuple[float, float]:
+    """Move a station just outside any storm without putting it on the threat axis."""
+    for _step in range(18):
+        storm = _inside_storm(east, north, storms)
+        if storm is None:
+            break
+        center_east = storm["east_km"]
+        center_north = storm["north_km"]
+        reach = storm["radius_km"] + NAUTICAL_MILE_KM
+        delta_east = east - center_east
+        delta_north = north - center_north
+        distance = math.hypot(delta_east, delta_north)
+        if distance < 0.05:
+            away = (storm["bearing"] + 180.0) % 360.0
+            if threat_bearing is not None:
+                away = _off_threat_axis(away, threat_bearing)
+            east, north = point_at(away, reach)
+        else:
+            east = center_east + delta_east / distance * reach
+            north = center_north + delta_north / distance * reach
+        station_bearing = bearing_deg(east, north)
+        course = bearing_deg(east - current_east, north - current_north)
+        blocked = threat_bearing is not None and (
+            wrap_delta(station_bearing, threat_bearing) < THREAT_EXCLUSION_DEG
+            or not _heading_clear(course, threat_bearing)
+        )
+        if not blocked:
+            continue
+        # Slide around the storm on the side that stays farther from the threat.
+        angle = math.atan2(east - center_east, north - center_north)
+        options = []
+        for sign in (1.0, -1.0):
+            turned = angle + sign * math.radians(12.0)
+            candidate = (
+                center_east + math.sin(turned) * reach,
+                center_north + math.cos(turned) * reach,
+            )
+            options.append(candidate)
+        if threat_bearing is None:
+            east, north = options[0]
+        else:
+            east, north = max(
+                options,
+                key=lambda point: wrap_delta(bearing_deg(point[0], point[1]), threat_bearing),
+            )
+    return east, north
+
+
+def _storm_path_km(
+    start_east: float,
+    start_north: float,
+    end_east: float,
+    end_north: float,
+    storms: list[dict],
+) -> float:
+    """Kilometers of this track that lie inside a storm, plus any depth still inside at the end."""
+    if not storms:
+        return 0.0
+    span = math.hypot(end_east - start_east, end_north - start_north)
+    steps = 48
+    if span < 0.05:
+        inside = 0.0
+    else:
+        hits = 0
+        for step in range(steps):
+            fraction = (step + 0.5) / steps
+            east = start_east + (end_east - start_east) * fraction
+            north = start_north + (end_north - start_north) * fraction
+            if _inside_storm(east, north, storms) is not None:
+                hits += 1
+        inside = span * hits / steps
+    end_storm = _inside_storm(end_east, end_north, storms)
+    if end_storm is not None:
+        distance = math.hypot(end_east - end_storm["east_km"], end_north - end_storm["north_km"])
+        inside += end_storm["radius_km"] - distance
+    return inside
+
+
 def _build_plan(
     name: str,
     rationale: str,
@@ -3242,13 +3561,18 @@ def _build_plan(
     outer_range: float,
     failed_bearings: list[float],
     threat_bearing: float | None = None,
+    storms: list[dict] | None = None,
+    turn_only: bool = False,
+    keep_heading: bool = False,
+    jammer: dict | None = None,
 ) -> dict:
     """One course set: a station for every healthy escort, plus coverage numbers."""
+    storms = storms or []
     _cost, pairs = _assignment_cost(escorts, bearings, station_range, origin_lat, origin_lon)
-    ordered = sorted(bearing for _ship, bearing in pairs)
     moves = []
     positions: list[tuple[float, float]] = []
     reach: list[float] = []
+    position_sectors: list = []
 
     # The carrier stays at the center. Its radar counts on the inner ring.
     # The outer ring is the escort screen: a failed escort leaves a hole there
@@ -3256,9 +3580,11 @@ def _build_plan(
     if hvu is not None and ranges.get(hvu["ship_id"], 0.0) > 0:
         positions.append((0.0, 0.0))
         reach.append(ranges[hvu["ship_id"]])
+        position_sectors.append(None)
 
     screen_positions: list[tuple[float, float]] = []
     screen_reach: list[float] = []
+    screen_sectors: list = []
 
     for escort, station_bearing in pairs:
         if threat_bearing is not None:
@@ -3287,25 +3613,63 @@ def _build_plan(
                 if not _heading_clear(course, threat_bearing):
                     course = _off_threat_axis(course, threat_bearing)
                 travel = 0.0
-                latitude, longitude = escort["latitude"], escort["longitude"]
-            else:
-                latitude, longitude = to_latlon(station_east, station_north, origin_lat, origin_lon)
-        else:
-            latitude, longitude = to_latlon(station_east, station_north, origin_lat, origin_lon)
-        if travel < 0.5 and escort["heading"] is not None and threat_bearing is None:
+        if storms:
+            station_east, station_north = _leave_storm(
+                station_east, station_north, current_east, current_north, storms, threat_bearing
+            )
+            course = bearing_deg(station_east - current_east, station_north - current_north)
+            travel = float(np.hypot(station_east - current_east, station_north - current_north))
+            station_bearing = bearing_deg(station_east, station_north)
+            if threat_bearing is not None and travel > 0.5 and (
+                not _heading_clear(course, threat_bearing)
+                or wrap_delta(station_bearing, threat_bearing) < THREAT_EXCLUSION_DEG - 0.1
+            ):
+                station_east, station_north = current_east, current_north
+                station_bearing = bearing_deg(current_east, current_north) if travel > 0.1 else station_bearing
+                course = escort["heading"] if escort["heading"] is not None else course
+                if threat_bearing is not None and not _heading_clear(course, threat_bearing):
+                    course = _off_threat_axis(course, threat_bearing)
+                travel = 0.0
+        if travel < 0.5 and escort["heading"] is not None and threat_bearing is None and not turn_only:
             course = escort["heading"]
+        if turn_only:
+            station_east, station_north = current_east, current_north
+            travel = 0.0
+            if float(np.hypot(current_east, current_north)) > 0.1:
+                station_bearing = bearing_deg(current_east, current_north)
+        bow = _bow_for_sector(
+            escort,
+            threat_bearing,
+            keep_heading,
+            None if jammer is None else jammer["bearing"],
+        )
+        if (
+            travel < 0.5
+            and _blind_width(escort.get("blind_start"), escort.get("blind_end")) < 0.5
+            and threat_bearing is not None
+            and not _heading_clear(bow, threat_bearing)
+        ):
+            bow = _off_threat_axis(bow, threat_bearing)
+        transit = bow if travel < 0.5 else course
+        blind_width = _blind_width(escort.get("blind_start"), escort.get("blind_end"))
+        blind_true = None
+        if 0.5 <= blind_width < 359.5:
+            blind_true = (bow + float(escort["blind_start"]) + blind_width / 2.0) % 360.0
         latitude, longitude = to_latlon(station_east, station_north, origin_lat, origin_lon)
-        sector_start, sector_end = _sector_bounds(station_bearing, ordered)
         moves.append(
             {
                 "ship_id": escort["ship_id"],
                 "ship_name": escort["ship_name"],
                 "ship_type": escort["ship_type"],
-                "heading": course,
+                "heading": bow,
+                "course_heading": transit,
+                "action": "turn only" if travel < 0.5 else "move then turn",
+                "radar_sector": _sector_brought(escort, bow, threat_bearing),
+                "blind_true": blind_true,
                 "station_bearing": station_bearing,
                 "station_range_km": float(np.hypot(station_east, station_north)),
-                "sector_start": sector_start,
-                "sector_end": sector_end,
+                "sector_start": None,
+                "sector_end": None,
                 "latitude": escort["latitude"],
                 "longitude": escort["longitude"],
                 "station_latitude": latitude,
@@ -3320,36 +3684,91 @@ def _build_plan(
         reach.append(station_reach)
         screen_positions.append(station)
         screen_reach.append(station_reach)
+        sector = (bow, escort.get("blind_start"), escort.get("blind_end"))
+        screen_sectors.append(sector)
+        position_sectors.append(sector)
+
+    final_bearings = sorted(move["station_bearing"] for move in moves)
+    for move in moves:
+        start, end = _sector_bounds(move["station_bearing"], final_bearings)
+        move["sector_start"] = start
+        move["sector_end"] = end
 
     if hvu is not None:
         hold_heading = hvu["heading"] if hvu["heading"] is not None else 0.0
         if threat_bearing is not None and not _heading_clear(hold_heading, threat_bearing):
             hold_heading = _off_threat_axis(hold_heading, threat_bearing)
+        hvu_east, hvu_north = 0.0, 0.0
+        hvu_travel = 0.0
+        if storms and not turn_only and _inside_storm(0.0, 0.0, storms) is not None:
+            # The carrier is the unit that must leave a nearby storm first.
+            hvu_east, hvu_north = _leave_storm(0.0, 0.0, 0.0, 0.0, storms, threat_bearing)
+            hvu_travel = float(np.hypot(hvu_east, hvu_north))
+            if hvu_travel > 0.5:
+                hold_heading = bearing_deg(hvu_east, hvu_north)
+                if threat_bearing is not None and not _heading_clear(hold_heading, threat_bearing):
+                    hvu_east, hvu_north = 0.0, 0.0
+                    hvu_travel = 0.0
+                    hold_heading = _off_threat_axis(hold_heading, threat_bearing)
+        hvu_lat, hvu_lon = to_latlon(hvu_east, hvu_north, origin_lat, origin_lon)
+        if hvu_travel > 0.5 and positions:
+            positions[0] = (hvu_east, hvu_north)
+        bow = _bow_for_sector(
+            hvu,
+            threat_bearing,
+            keep_heading,
+            None if jammer is None else jammer["bearing"],
+        )
+        if hvu_travel > 0.5:
+            transit = hold_heading
+        else:
+            transit = bow
+            if (
+                _blind_width(hvu.get("blind_start"), hvu.get("blind_end")) < 0.5
+                and threat_bearing is not None
+                and not _heading_clear(bow, threat_bearing)
+            ):
+                bow = _off_threat_axis(bow, threat_bearing)
+                transit = bow
+        hvu_blind = _blind_width(hvu.get("blind_start"), hvu.get("blind_end"))
+        hvu_blind_true = None
+        if 0.5 <= hvu_blind < 359.5:
+            hvu_blind_true = (bow + float(hvu["blind_start"]) + hvu_blind / 2.0) % 360.0
+        if position_sectors:
+            position_sectors[0] = (bow, hvu.get("blind_start"), hvu.get("blind_end"))
         moves.insert(
             0,
             {
                 "ship_id": hvu["ship_id"],
                 "ship_name": hvu["ship_name"],
                 "ship_type": hvu["ship_type"],
-                "heading": hold_heading,
-                "station_bearing": None,
-                "station_range_km": 0.0,
+                "heading": bow,
+                "course_heading": transit,
+                "action": "turn only" if hvu_travel < 0.5 else "move then turn",
+                "radar_sector": _sector_brought(hvu, bow, threat_bearing),
+                "blind_true": hvu_blind_true,
+                "station_bearing": bearing_deg(hvu_east, hvu_north) if hvu_travel > 0.5 else None,
+                "station_range_km": hvu_travel,
                 "sector_start": None,
                 "sector_end": None,
                 "latitude": hvu["latitude"],
                 "longitude": hvu["longitude"],
-                "station_latitude": hvu["latitude"],
-                "station_longitude": hvu["longitude"],
-                "travel_km": 0.0,
+                "station_latitude": hvu_lat if hvu_travel > 0.5 else hvu["latitude"],
+                "station_longitude": hvu_lon if hvu_travel > 0.5 else hvu["longitude"],
+                "travel_km": hvu_travel,
                 "role": "hvu",
             },
         )
 
-    outer_pct, outer_gaps = ring_coverage(screen_positions, screen_reach, outer_range)
-    inner_pct, inner_gaps = ring_coverage(positions, reach, INNER_RANGE_KM)
-    failed_pct = _failed_sector_coverage(screen_positions, screen_reach, outer_range, failed_bearings)
+    outer_pct, outer_gaps = ring_coverage(screen_positions, screen_reach, outer_range, screen_sectors, jammer)
+    inner_pct, inner_gaps = ring_coverage(positions, reach, INNER_RANGE_KM, position_sectors, jammer)
+    failed_pct = _failed_sector_coverage(
+        screen_positions, screen_reach, outer_range, failed_bearings, screen_sectors, jammer
+    )
     threat_pct = (
-        _failed_sector_coverage(screen_positions, screen_reach, outer_range, [threat_bearing])
+        _failed_sector_coverage(
+            screen_positions, screen_reach, outer_range, [threat_bearing], screen_sectors, jammer
+        )
         if threat_bearing is not None
         else failed_pct
     )
@@ -3361,10 +3780,32 @@ def _build_plan(
             for move in moves
             if move["role"] == "escort"
             and move["travel_km"] > 0.5
-            and not _heading_clear(move["heading"], threat_bearing)
+            and not _heading_clear(move.get("course_heading", move["heading"]), threat_bearing)
         )
-    # Threat-axis coverage counts more than the far side of the ring.
-    score = 1.6 * threat_pct + 0.35 * outer_pct + 0.15 * inner_pct - 0.25 * mean_travel - 40.0 * unsafe
+    speed_km_h = STORM_EXIT_SPEED_KT * NAUTICAL_MILE_KM
+    storm_hours = 0.0
+    cvn_storm_hours = 0.0
+    if storms:
+        for move in moves:
+            start_east, start_north = to_xy(move["latitude"], move["longitude"], origin_lat, origin_lon)
+            end_east, end_north = to_xy(
+                move["station_latitude"], move["station_longitude"], origin_lat, origin_lon
+            )
+            hours = _storm_path_km(start_east, start_north, end_east, end_north, storms) / speed_km_h
+            weight = 3.0 if move["role"] == "hvu" else 1.0
+            if move["role"] == "hvu":
+                cvn_storm_hours = hours
+            storm_hours += weight * hours
+    # Threat coverage still leads. Storm time breaks ties toward the faster exit.
+    score = (
+        1.6 * threat_pct
+        + 0.35 * outer_pct
+        + 0.15 * inner_pct
+        - 0.25 * mean_travel
+        - 40.0 * unsafe
+        - 15.0 * storm_hours
+        - 8.0 * _jammed_face_penalty(moves, jammer, threat_bearing)
+    )
 
     return {
         "name": name,
@@ -3378,6 +3819,10 @@ def _build_plan(
         "failed_sector_pct": failed_pct,
         "threat_pct": threat_pct,
         "threat_bearing": threat_bearing,
+        "turn_only": turn_only,
+        "storm_hours": storm_hours,
+        "cvn_storm_hours": cvn_storm_hours,
+        "storm_count": len(storms),
         "outer_range_km": outer_range,
         "score": score,
         "positions": screen_positions,
@@ -3390,16 +3835,21 @@ def recommend_courses(
     ranges: dict[str, float],
     capacity: dict[str, float],
     threat_bearing: float | None = None,
+    weather_report: pd.DataFrame | None = None,
+    jammer: dict | None = None,
 ) -> tuple[list[dict], str, float]:
     """Three stationing plans ranked Best / Acceptable / Fallback.
 
     Escorts with any remaining capacity are stationed. Their reach is already
     scaled. Ships at 0% stay off the screen. When a threat bearing is given,
     stations sit on either side of that axis and no course points along it.
+    A storm within 60 nm of the carrier, taken from snooze_cruise, lowers a
+    plan that keeps ships inside it. The carrier's time counts three times.
     """
     ships = _located_ships(locations)
     if not ships:
         return [], "no located ships", INNER_RANGE_KM
+    _attach_radar_sectors(ships, weather_report)
 
     hvu, origin_lat, origin_lon, datum_label = choose_datum(ships)
     hvu_id = hvu["ship_id"] if hvu is not None else None
@@ -3429,6 +3879,7 @@ def recommend_courses(
         if np.hypot(east, north) > 0.1:
             failed_bearings.append(bearing_deg(east, north))
     gap_offset = circular_mean(failed_bearings) if failed_bearings else (balanced_offset + 40.0) % 360.0
+    storms = storms_from_report(weather_report)
 
     if threat_bearing is None:
         templates = [
@@ -3489,10 +3940,75 @@ def recommend_courses(
             outer_range,
             failed_bearings,
             threat_bearing,
+            storms,
+            jammer=jammer,
         )
         for name, rationale, bearings, station_range in templates
     ]
+    turn_bearings = (
+        _threat_shoulders(len(escorts), threat_bearing, 40.0)
+        if threat_bearing is not None
+        else even_bearings(len(escorts), 0.0)
+    )
+    plans.append(
+        _build_plan(
+            "Turn in place",
+            "Hold station and train a healthy array face on the threat. A move is used only when turning cannot match that coverage.",
+            escorts,
+            turn_bearings,
+            18.0,
+            hvu,
+            origin_lat,
+            origin_lon,
+            ranges,
+            outer_range,
+            failed_bearings,
+            threat_bearing,
+            storms,
+            turn_only=True,
+            jammer=jammer,
+        )
+    )
+    baseline = _build_plan(
+        "Current heading",
+        "",
+        escorts,
+        turn_bearings,
+        18.0,
+        hvu,
+        origin_lat,
+        origin_lon,
+        ranges,
+        outer_range,
+        failed_bearings,
+        threat_bearing,
+        storms,
+        turn_only=True,
+        keep_heading=True,
+        jammer=jammer,
+    )
+    if jammer is not None:
+        jammer_note = (
+            f" Jammer on {jammer['bearing']:.0f}° at {jammer['erp']:.0f} kW, "
+            f"SJR {jammer['sjr']:.1f} dB"
+            f"{', ducting on' if jammer['ducting'] else ''}. "
+            f"Degraded faces are kept off that bearing and off the threat. "
+            f"Stored optimal_action is {jammer['action']}."
+        )
+        for plan in plans:
+            plan["rationale"] = plan["rationale"] + jammer_note
+            plan["jammer_text"] = (
+                f"Jammer {jammer['bearing']:.0f}°  {jammer['erp']:.0f} kW  "
+                f"SJR {jammer['sjr']:.1f} dB"
+            )
+    for plan in plans:
+        plan["coverage_gain"] = plan["threat_pct"] - baseline["threat_pct"]
     plans.sort(key=lambda plan: plan["score"], reverse=True)
+    turn_plan = next(plan for plan in plans if plan.get("turn_only"))
+    move_plans = [plan for plan in plans if not plan.get("turn_only")]
+    if move_plans and turn_plan["threat_pct"] + 0.5 >= max(plan["threat_pct"] for plan in move_plans):
+        plans = [turn_plan] + [plan for plan in plans if plan is not turn_plan]
+    plans = plans[:3]
     for index, plan in enumerate(plans):
         plan["rank"] = index + 1
         plan["rank_label"] = RANK_LABELS[index]
@@ -3529,6 +4045,8 @@ def print_recommendations(
         print()
         print(f"Course Option {plan['rank']}: {plan['rank_label']} — {plan['name']}")
         print(f"Rationale: {plan['rationale']}")
+        if plan.get("jammer_text"):
+            print(f"Jamming: {plan['jammer_text']}")
         print(
             f"Collective coverage: {plan['outer_pct']:.1f}% at {plan['outer_range_km']:.0f} km, "
             f"{plan['inner_pct']:.1f}% at {INNER_RANGE_KM:.0f} km"
@@ -3541,7 +4059,21 @@ def print_recommendations(
                 f"Threat-axis coverage (±30° of {plan['threat_bearing']:.0f}°): "
                 f"{plan['threat_pct']:.0f}%"
             )
+            gain = plan.get("coverage_gain")
+            if gain is not None:
+                print(f"Threat-axis change versus current headings: {gain:+.0f} points")
             print(f"Stations stay at least {THREAT_EXCLUSION_DEG:.0f}° off the threat axis.")
+        if plan.get("storm_count"):
+            if plan.get("storm_hours"):
+                print(
+                    f"Time in storms within {STORM_WATCH_NM:.0f} nm of the carrier: "
+                    f"{plan['storm_hours']:.2f} h weighted "
+                    f"(CVN {plan['cvn_storm_hours']:.2f} h, counted three times)."
+                )
+            else:
+                print(
+                    f"No recommended track stays inside a storm within {STORM_WATCH_NM:.0f} nm of the carrier."
+                )
         for move in plan["moves"]:
             print()
             remaining = capacity.get(move["ship_id"], 100.0)
@@ -3551,8 +4083,17 @@ def print_recommendations(
                 f" — {remaining:.0f}% capacity, {reach:.0f} km"
             )
             print(f"    Recommended heading: {_format_heading(move['heading'])}")
-            if move["role"] == "hvu":
+            print(f"    Action: {move.get('action', 'move then turn')}")
+            if move.get("action") == "move then turn":
+                print(f"    Transit course: {_format_heading(move.get('course_heading', move['heading']))}")
+            print(f"    Radar sector: {move.get('radar_sector', 'full azimuth')}")
+            if move["role"] == "hvu" and move["travel_km"] < 0.5:
                 print("    Station: remain on datum (range 0 km)")
+            elif move["role"] == "hvu":
+                print(
+                    f"    Station: leave the storm, bearing {move['station_bearing']:.0f}° "
+                    f"at {move['station_range_km']:.0f} km from datum"
+                )
             else:
                 print(
                     f"    Station: bearing {move['station_bearing']:.0f}° "
@@ -3608,7 +4149,7 @@ def _draw_courses(axis, plans: list[dict]) -> None:
     for plan in plans:
         axis.plot([], [], color=plan["color"], linestyle=plan["linestyle"], lw=2, label=plan["legend"])
         for move in plan["moves"]:
-            if move["role"] != "escort":
+            if move["travel_km"] < 0.5:
                 continue
             arrow = FancyArrowPatch(
                 (move["longitude"], move["latitude"]),
@@ -3658,16 +4199,31 @@ def _course_note(report: pd.DataFrame, plans: list[dict]) -> str:
         lines.append(
             f"Threat {best['threat_bearing']:.0f}°  axis cover {best['threat_pct']:.0f}%"
         )
+    if best.get("storm_hours"):
+        lines.append(f"Storm time {best['storm_hours']:.2f} h within {STORM_WATCH_NM:.0f} nm")
+    if best.get("jammer_text"):
+        lines.append(best["jammer_text"])
     listed: set[str] = set()
     for move in best["moves"]:
         listed.add(move["ship_id"])
         heading = f"{move['heading'] % 360.0:05.1f}°"
-        if move["role"] == "hvu":
-            lines.append(f"{move['ship_id']:<8} {heading}  hold datum")
+        action = move.get("action", "turn only")
+        short = "turn" if action == "turn only" else "move+turn"
+        sector = move.get("radar_sector", "")
+        face = ""
+        if "face" in sector:
+            face = " " + sector.split("face", 1)[1].split("rel", 1)[0].strip()
+        if move["role"] == "hvu" and move["travel_km"] < 0.5:
+            lines.append(f"{move['ship_id']:<8} {heading}  {short}{face}")
+        elif move["role"] == "hvu":
+            lines.append(
+                f"{move['ship_id']:<8} {heading}  {short} "
+                f"{move['station_range_km']:.0f} km"
+            )
         else:
             lines.append(
-                f"{move['ship_id']:<8} {heading}"
-                f"  brg {move['station_bearing']:.0f}° / {move['station_range_km']:.0f} km"
+                f"{move['ship_id']:<8} {heading}  {short}{face}"
+                f"  brg {move['station_bearing']:.0f}°"
             )
     # Ships with no remaining radar are not given a new station.
     for row in report.sort_values("ship_id").itertuples(index=False):
@@ -3808,6 +4364,18 @@ def plot_best_course(plan: dict, origin_lat: float, origin_lon: float, datum_lab
                 fontsize=9,
                 zorder=7,
             )
+            if move["travel_km"] > 0.5:
+                map_axis.add_patch(
+                    FancyArrowPatch(
+                        (move["longitude"], move["latitude"]),
+                        (move["station_longitude"], move["station_latitude"]),
+                        arrowstyle="-|>",
+                        mutation_scale=12,
+                        linewidth=1.7,
+                        color=plan["color"],
+                        zorder=4,
+                    )
+                )
             continue
         color = sector_colors[escort_index % len(sector_colors)]
         escort_index += 1
@@ -3880,6 +4448,7 @@ def analyze_frames(
     title: str | None = None,
     threat_bearing: float | None = None,
     threat_range_km: float | None = None,
+    jammer: dict | None = None,
 ) -> None:
     """Run the capacity report, course ranking, and both figures for one snapshot."""
     report = attach_locations(assess_capacity(radar, locations), locations)
@@ -3892,7 +4461,7 @@ def analyze_frames(
         return
 
     plans, datum_label, outer_range = recommend_courses(
-        locations, ranges, capacity, threat_bearing=threat_bearing
+        locations, ranges, capacity, threat_bearing=threat_bearing, weather_report=report, jammer=jammer
     )
     print_recommendations(plans, datum_label, outer_range, capacity, ranges)
     plot_status(locations, report, plans, STATUS_FIGURE, title=title, threat_bearing=threat_bearing)
@@ -4022,6 +4591,9 @@ def _casrep_events() -> list[dict]:
             "assistance": "NOT REQUIRED. SHIP'S FORCE EFFECTING REPAIRS.",
             "fault_code": "XMTR_MODULE",
             "seq": "001",
+            "affected_start_rel": 90,
+            "affected_end_rel": 180,
+            "radar_face": "2",
         },
         {
             "ship_id": "CG-58",
@@ -4047,6 +4619,9 @@ def _casrep_events() -> list[dict]:
             "assistance": "REQUEST TECH ASSIST FROM CSG STAFF. PARTS NOT ON BOARD.",
             "fault_code": "TRANSMITTER_FAIL",
             "seq": "001",
+            "affected_start_rel": 0,
+            "affected_end_rel": 360,
+            "radar_face": "1-4",
         },
         {
             "ship_id": "DDG-112",
@@ -4072,6 +4647,9 @@ def _casrep_events() -> list[dict]:
             "assistance": "NOT REQUIRED UNLESS SECOND STRING FAILS.",
             "fault_code": "PROCESSOR_OVERTEMP",
             "seq": "001",
+            "affected_start_rel": 180,
+            "affected_end_rel": 270,
+            "radar_face": "3",
         },
     ]
 
@@ -4118,6 +4696,11 @@ def render_casrep(event: dict, ship: dict, latitude: float, longitude: float) ->
             f"7. MISSION IMPACT: {event['impact']}",
             f"8. REMAINING CAPABILITY: {int(event['capacity_percent'])} PERCENT",
             f"9. RADAR STATUS: {event['radar_status']}",
+            f"RADAR: {event['nomenclature']}",
+            (
+                f"AFFECTED SECTOR: {int(event['affected_start_rel']):03d}-"
+                f"{int(event['affected_end_rel']):03d} RELATIVE FACE {event['radar_face']}"
+            ),
             "10. PARTS REQUIRED:",
             parts,
             f"11. ESTIMATED TIME TO REPAIR: {int(event['etr_hours'])} HOURS",
@@ -4135,8 +4718,13 @@ def parse_casrep(text: str) -> dict:
     time_match = re.search(r"DTG:\s*(\d{2})(\d{2})(\d{2})(\d{2})Z", text)
     capacity_match = re.search(r"REMAINING CAPABILITY:\s*(\d+)\s*PERCENT", text)
     status_match = re.search(r"RADAR STATUS:\s*(OK|DEGRADED|FAILED)", text)
-    if not all((ship_match, ref_match, time_match, capacity_match, status_match)):
-        raise ValueError("CASREP is missing ship, reference, DTG, status, or remaining capability")
+    radar_match = re.search(r"^RADAR:\s*(.+)$", text, re.M)
+    sector_match = re.search(
+        r"AFFECTED SECTOR:\s*(\d+)-(\d+)\s+RELATIVE(?:\s+FACE\s+(\S+))?",
+        text,
+    )
+    if not all((ship_match, ref_match, time_match, capacity_match, status_match, radar_match, sector_match)):
+        raise ValueError("CASREP is missing ship, radar, sector, reference, DTG, status, or remaining capability")
     day = int(time_match.group(1))
     hour = int(time_match.group(2))
     minute = int(time_match.group(3))
@@ -4151,6 +4739,10 @@ def parse_casrep(text: str) -> dict:
         "time_seconds": float(elapsed),
         "capacity_percent": float(capacity_match.group(1)),
         "radar_status": status_match.group(1),
+        "radar_nomenclature": radar_match.group(1).strip(),
+        "blind_start_rel": float(sector_match.group(1)),
+        "blind_end_rel": float(sector_match.group(2)),
+        "radar_face": (sector_match.group(3) or "").strip(),
     }
 
 
@@ -4176,22 +4768,31 @@ def write_casreps(
         parsed.append(record)
         index_lines.append(
             f"{record['casrep_reference']}  T+{record['time_seconds']:.0f}s  "
-            f"{record['ship_id']}  {record['radar_status']}  {record['capacity_percent']:.0f}%"
+            f"{record['ship_id']}  {record['radar_nomenclature']}  {record['radar_status']}  "
+            f"{record['capacity_percent']:.0f}%  face {record['radar_face']}  "
+            f"rel {record['blind_start_rel']:.0f}-{record['blind_end_rel']:.0f}"
         )
     (folder / "INDEX.txt").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
     return parsed
 
 
-def _capacity_from_casreps(casreps: list[dict], ship_id: str, elapsed_s: float) -> tuple[float, str]:
-    """Latest CASREP at or before this time. No report means full capacity."""
+def _active_casrep(casreps: list[dict], ship_id: str, elapsed_s: float) -> dict | None:
+    """Latest parsed CASREP at or before this time."""
     active = [
         item
         for item in casreps
         if item["ship_id"] == ship_id and item["time_seconds"] <= elapsed_s + 1e-6
     ]
     if not active:
+        return None
+    return max(active, key=lambda item: item["time_seconds"])
+
+
+def _capacity_from_casreps(casreps: list[dict], ship_id: str, elapsed_s: float) -> tuple[float, str]:
+    """Latest CASREP at or before this time. No report means full capacity."""
+    latest = _active_casrep(casreps, ship_id, elapsed_s)
+    if latest is None:
         return 100.0, "NONE"
-    latest = max(active, key=lambda item: item["time_seconds"])
     return float(latest["capacity_percent"]), str(latest["casrep_reference"])
 
 
@@ -4273,6 +4874,13 @@ def build_snooze_cruise() -> pd.DataFrame:
             rotated_north = -east * sine + north * cosine
             ship_lat, ship_lon = to_latlon(rotated_east, rotated_north, carrier_lat, carrier_lon)
             percent, casrep_reference = _capacity_from_casreps(casreps, ship["ship_id"], float(instant))
+            detail = _active_casrep(casreps, ship["ship_id"], float(instant))
+            radar_name = detail["radar_nomenclature"] if detail else {
+                "CVN-78": "AN/SPY-6",
+                "CG-58": "AN/SPY-1B",
+                "DDG-101": "AN/SPY-1D(V)",
+                "DDG-112": "AN/SPY-1D(V)",
+            }.get(ship["ship_id"], "radar")
             status = "OK"
             for item in casreps:
                 if item["casrep_reference"] == casrep_reference:
@@ -4310,6 +4918,10 @@ def build_snooze_cruise() -> pd.DataFrame:
                     "threat_range_km": 160.0,
                     "threat_priority": 1,
                     "casrep_reference": casrep_reference,
+                    "radar_nomenclature": radar_name,
+                    "blind_sector_start_rel": None if detail is None else detail["blind_start_rel"],
+                    "blind_sector_end_rel": None if detail is None else detail["blind_end_rel"],
+                    "radar_face": "" if detail is None else detail["radar_face"],
                     "power_status": power,
                     "cooling_status": cooling,
                     "last_maintenance": "2026-10-15",
@@ -4360,6 +4972,68 @@ def attach_scenario_weather(frame: pd.DataFrame) -> pd.DataFrame:
     frame["solar_flare_class"] = "none"
     frame["weather_source"] = "snooze_cruise ITU-R P.838-3 scenario"
     frame["effective_range_km"] = frame["effective_range_km"] * frame["weather_range_factor"]
+    return frame
+
+
+def _write_casrep_sectors(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """Rewrite the CASREP texts with radar and sector lines, then store what was parsed.
+
+    The messages are the source of the radar name and the blind sector. Rows
+    before a CASREP keep a healthy radar. The full table, including rows that
+    are not ship tracks, is written back to snooze_cruise.
+    """
+    events = _casrep_events()
+    fleet = {ship["ship_id"]: ship for ship in FLEET}
+    positions: dict[tuple[str, float], tuple[float, float]] = {}
+    for event in events:
+        rows = frame.loc[frame["ship_id"] == event["ship_id"]]
+        if "latitude" in rows.columns:
+            rows = rows.loc[rows["latitude"].notna() & rows["time_seconds"].notna()]
+        if rows.empty:
+            ship = fleet[event["ship_id"]]
+            latitude, longitude = float(ship["latitude"]), float(ship["longitude"])
+        else:
+            index = (rows["time_seconds"] - event["time_seconds"]).abs().idxmin()
+            latitude = float(rows.loc[index, "latitude"])
+            longitude = float(rows.loc[index, "longitude"])
+        positions[(event["ship_id"], event["time_seconds"])] = (latitude, longitude)
+    parsed = {item["ship_id"]: item for item in write_casreps(events, positions)}
+    names: list[str] = []
+    starts: list[float] = []
+    ends: list[float] = []
+    faces: list[str] = []
+    defaults = {
+        "CVN-78": "AN/SPY-6",
+        "CG-58": "AN/SPY-1B",
+        "DDG-101": "AN/SPY-1D(V)",
+        "DDG-112": "AN/SPY-1D(V)",
+    }
+    for row in frame.itertuples(index=False):
+        ship_id = str(row.ship_id).strip()
+        detail = parsed.get(ship_id)
+        elapsed = getattr(row, "time_seconds", None)
+        active = (
+            detail is not None
+            and elapsed is not None
+            and not (isinstance(elapsed, float) and math.isnan(elapsed))
+            and float(elapsed) + 1e-6 >= detail["time_seconds"]
+        )
+        if active and detail is not None:
+            names.append(detail["radar_nomenclature"])
+            starts.append(float(detail["blind_start_rel"]))
+            ends.append(float(detail["blind_end_rel"]))
+            faces.append(detail["radar_face"])
+        else:
+            names.append(defaults.get(ship_id, ""))
+            starts.append(float("nan"))
+            ends.append(float("nan"))
+            faces.append("")
+    frame = frame.copy()
+    frame["radar_nomenclature"] = names
+    frame["blind_sector_start_rel"] = starts
+    frame["blind_sector_end_rel"] = ends
+    frame["radar_face"] = faces
+    frame.to_csv(path, index=False)
     return frame
 
 
@@ -4420,8 +5094,26 @@ def load_snooze(path: Path) -> pd.DataFrame:
         "track_quality",
     ):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if frame["time_seconds"].isna().any() or frame["latitude"].isna().any():
-        raise ValueError(f"{path} has a blank time or position")
+    frame = _write_casrep_sectors(frame, path)
+    if "bearing_deg" in frame.columns and "jammer_bearing_deg" not in frame.columns:
+        frame["jammer_bearing_deg"] = frame["bearing_deg"]
+    jammer_rows = frame.iloc[0:0]
+    if "jammer_type" in frame.columns:
+        kind = frame["record_kind"].astype(str) if "record_kind" in frame.columns else ""
+        jammer_rows = frame.loc[
+            frame["jammer_type"].notna()
+            & (kind.eq("jammer") if "record_kind" in frame.columns else frame["latitude"].isna())
+        ].copy()
+    # Jammer and casualty rows in a merged snooze_cruise have no track. The
+    # loop uses the strike-group rows, which carry weather and radar fields.
+    frame = frame.loc[
+        frame["time_seconds"].notna()
+        & frame["latitude"].notna()
+        & frame["longitude"].notna()
+        & ~frame["ship_id"].str.lower().isin(["", "nan", "none"])
+    ].copy()
+    if frame.empty:
+        raise ValueError(f"{path} has no ship track with a time and a position")
     for optional, default in (
         ("radar_status", "OK"),
         ("radar_mode", "SEARCH"),
@@ -4433,7 +5125,9 @@ def load_snooze(path: Path) -> pd.DataFrame:
     ):
         if optional not in frame.columns:
             frame[optional] = default
-    return frame.sort_values(["ship_id", "time_seconds"]).reset_index(drop=True)
+    track = frame.sort_values(["ship_id", "time_seconds"]).reset_index(drop=True)
+    track.attrs["jammers"] = jammer_rows.reset_index(drop=True)
+    return track
 
 
 def _bracket(group: pd.DataFrame, elapsed_s: float) -> tuple[pd.Series, pd.Series, float]:
@@ -4506,6 +5200,18 @@ def snapshot_at(group: pd.DataFrame, elapsed_s: float) -> dict:
         "weather_range_factor": float(low["weather_range_factor"]) if "weather_range_factor" in low.index else 1.0,
         "solar_flare_class": str(low["solar_flare_class"]) if "solar_flare_class" in low.index else "none",
         "weather_source": str(low["weather_source"]) if "weather_source" in low.index else "",
+        "radar_nomenclature": str(low["radar_nomenclature"]) if "radar_nomenclature" in low.index else "",
+        "blind_sector_start_rel": (
+            float(low["blind_sector_start_rel"])
+            if "blind_sector_start_rel" in low.index and pd.notna(low["blind_sector_start_rel"])
+            else None
+        ),
+        "blind_sector_end_rel": (
+            float(low["blind_sector_end_rel"])
+            if "blind_sector_end_rel" in low.index and pd.notna(low["blind_sector_end_rel"])
+            else None
+        ),
+        "radar_face": str(low["radar_face"]) if "radar_face" in low.index and pd.notna(low["radar_face"]) else "",
     }
 
 
@@ -4595,6 +5301,43 @@ def schedule_text(cruise: pd.DataFrame) -> str:
     return ", ".join(f"T+{instant:.0f}s {ship_id} → {percent:.0f}%" for instant, ship_id, percent in changes)
 
 
+def jammer_at(table: pd.DataFrame | None, elapsed_s: float) -> dict | None:
+    """One jammer row from snooze_cruise for this simulation time.
+
+    Jammer records are not tied to a ship, so the row index follows the
+    2-second clock. Poor SJR or high ERP shortens range around that bearing.
+    """
+    if table is None or len(table) == 0:
+        return None
+    index = int(elapsed_s / UPDATE_INTERVAL_SECONDS) % len(table)
+    row = table.iloc[index]
+    if "jammer_bearing_deg" in row.index and pd.notna(row["jammer_bearing_deg"]):
+        bearing = float(row["jammer_bearing_deg"])
+    elif "bearing_deg" in row.index and pd.notna(row["bearing_deg"]):
+        bearing = float(row["bearing_deg"])
+    else:
+        return None
+    sjr = float(row["sjr_db"])
+    erp = float(row["erp_kw"])
+    ducting = bool(int(float(row["atmospheric_ducting"]))) if pd.notna(row["atmospheric_ducting"]) else False
+    sjr_bad = min(1.0, max(0.0, (3.0 - sjr) / 25.0))
+    erp_bad = min(1.0, max(0.0, erp / 400.0))
+    strength = max(sjr_bad, 0.65 * erp_bad)
+    if ducting:
+        strength = min(1.0, strength * 1.2)
+    action = row["optimal_action"]
+    return {
+        "bearing": bearing % 360.0,
+        "sjr": sjr,
+        "erp": erp,
+        "ducting": ducting,
+        "factor": max(0.4, 1.0 - 0.55 * strength),
+        "half": 45.0 if ducting else 30.0,
+        "jammer_type": row["jammer_type"],
+        "action": int(float(action)) if pd.notna(action) else 0,
+    }
+
+
 def run_monitor(
     interval: float,
     total_runtime: float,
@@ -4609,6 +5352,7 @@ def run_monitor(
     if max_cycles is not None:
         updates = max(1, max_cycles)
     scenario = Scenario(cruise)
+    jammers = cruise.attrs.get("jammers")
     plt.ion()
     print(
         f"Live radar monitor. Update every {interval:g} s. "
@@ -4627,16 +5371,24 @@ def run_monitor(
             state.to_csv(LIVE_STATE_FIGURE, index=False)
             threat = float(state["threat_bearing_deg"].iloc[0])
             threat_range = state["threat_range_km"].iloc[0] if "threat_range_km" in state.columns else None
+            jammer = jammer_at(jammers, scenario.elapsed_s)
+            jammer_title = f" — jammer {jammer['bearing']:.0f}°" if jammer else ""
             title = (
                 f"Carrier Strike Group radar status — "
                 f"T+{scenario.elapsed_s:.0f} s ({stamp.strftime('%H:%M:%S')} UTC)"
-                f" — {remaining:.0f} s left — threat {threat:.0f}°"
+                f" — {remaining:.0f} s left — threat {threat:.0f}°{jammer_title}"
             )
             print()
             print(
                 f"--- {stamp.strftime('%Y-%m-%d %H:%M:%S UTC')}  |  "
                 f"simulation T+{scenario.elapsed_s:.0f} s  |  "
-                f"{remaining:.0f} s remaining  |  threat {threat:.0f}° ---"
+                f"{remaining:.0f} s remaining  |  threat {threat:.0f}°"
+                + (
+                    f"  |  jammer {jammer['bearing']:.0f}°  {jammer['erp']:.0f} kW  "
+                    f"SJR {jammer['sjr']:.1f} dB ---"
+                    if jammer
+                    else " ---"
+                )
             )
             print_ship_state(state)
             for row in state.itertuples(index=False):
@@ -4654,6 +5406,7 @@ def run_monitor(
                 title=title,
                 threat_bearing=threat,
                 threat_range_km=None if threat_range is None or pd.isna(threat_range) else float(threat_range),
+                jammer=jammer,
             )
             plt.show(block=False)
             plt.pause(0.05)
