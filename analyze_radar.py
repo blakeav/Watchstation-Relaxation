@@ -27,14 +27,16 @@ step. It holds positions, radar metrics, and the capacity schedule:
     track_quality, radar_mode
     threat_bearing_deg
     threat_range_km, threat_priority   (optional)
+    casrep_reference                   (optional; links a row to casreps/*.txt)
     power_status, cooling_status, last_maintenance, fault_code
 
 Latitude, longitude, and threat_bearing_deg change with time_seconds.
-capacity_percent in the same file is the outage schedule (for example 60
-at T+12 s, 0 at T+32 s, 40 at T+52 s). The loop picks or interpolates the
-rows for the current clock. Courses cover the threat axis from stations
-at least 25° off that axis, so no ship is steered onto the threat vector.
-Recommendations are still produced when every radar is at 100%.
+capacity_percent and radar_status are copied out of the CASREP messages
+written to casreps/ (for example 60 at T+12 s, 0 at T+32 s, 40 at T+52 s).
+The loop picks or interpolates the rows for the current clock. Courses
+cover the threat axis from stations at least 25° off that axis, so no ship
+is steered onto the threat vector. Recommendations are still produced
+when every radar is at 100%.
 
 One-shot CSV analysis:
 
@@ -61,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import re
 import sys
 import time
 from pathlib import Path
@@ -90,6 +93,7 @@ STATUS_FIGURE = Path("strike_group_radar_status.png")
 COURSE_FIGURE = Path("strike_group_recommended_courses.png")
 LIVE_STATE_FIGURE = Path("live_ship_state.csv")
 SNOOZE_FILE = Path("snooze_cruise.csv")
+CASREP_DIR = Path("casreps")
 TIMELINE_FILE = Path("radar_timeline.csv")
 TIMELINE_COLUMNS = ["time_seconds", "ship_id", "new_capacity_percent"]
 
@@ -281,6 +285,11 @@ def assess_capacity(radar: pd.DataFrame, locations: pd.DataFrame) -> pd.DataFram
         current = float(capacities.iloc[-1])
         reduced = group.loc[capacities.lt(99.5)]
         began = reduced["timestamp"].min() if not reduced.empty else pd.NaT
+        casrep = "NONE"
+        if "casrep_reference" in group.columns:
+            latest = group.iloc[-1]["casrep_reference"]
+            if pd.notna(latest) and str(latest).strip() not in {"", "NONE", "nan"}:
+                casrep = str(latest).strip()
         records.append(
             {
                 "ship_id": str(ship_id),
@@ -289,6 +298,7 @@ def assess_capacity(radar: pd.DataFrame, locations: pd.DataFrame) -> pd.DataFram
                 "full_range_km": full_range,
                 "effective_range_km": full_range * current / 100.0,
                 "loss_began": began,
+                "casrep_reference": casrep,
             }
         )
     return pd.DataFrame.from_records(records)
@@ -320,9 +330,16 @@ def format_time(value: object) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def print_capacity(report: pd.DataFrame) -> None:
+def print_capacity(
+    report: pd.DataFrame,
+    threat_bearing: float | None = None,
+    threat_range_km: float | None = None,
+) -> None:
     """Print every ship's full capacity against what it has left."""
     print("Radar capacity")
+    if threat_bearing is not None:
+        span = f", range {threat_range_km:.0f} km" if threat_range_km is not None else ""
+        print(f"Threat bearing: {threat_bearing:.0f}° true{span}")
     print(f"{'Ship':<10}{'Full':>8}{'Current':>10}{'Lost':>8}{'Full range':>12}{'Effective':>12}")
     for row in report.sort_values("ship_id").itertuples(index=False):
         print(
@@ -359,6 +376,11 @@ def print_capacity(report: pd.DataFrame) -> None:
         print(f"Position:      {position}")
         print(f"Remaining:     {row.capacity_percent:.0f}%")
         print(f"Lost:          {row.percent_lost:.0f}%")
+        casrep = getattr(row, "casrep_reference", "NONE")
+        if casrep and str(casrep) not in {"NONE", "nan"}:
+            print(f"CASREP:        {casrep}")
+        if threat_bearing is not None:
+            print(f"Threat bearing: {threat_bearing:.0f}° true")
 
 
 def default_range_km(ship_type: object) -> float:
@@ -1301,10 +1323,7 @@ def analyze_frames(
 ) -> None:
     """Run the capacity report, course ranking, and both figures for one snapshot."""
     report = attach_locations(assess_capacity(radar, locations), locations)
-    print_capacity(report)
-    if threat_bearing is not None:
-        span = f", range {threat_range_km:.0f} km" if threat_range_km is not None else ""
-        print(f"Threat bearing: {threat_bearing:.0f}° true{span}")
+    print_capacity(report, threat_bearing=threat_bearing, threat_range_km=threat_range_km)
     capacity = {str(row.ship_id): float(row.capacity_percent) for row in report.itertuples(index=False)}
     ranges = effective_ranges(report)
     # A known threat still needs a screen when every radar is healthy.
@@ -1416,12 +1435,233 @@ def _lerp_heading(start: float, end: float, fraction: float) -> float:
     return (start + delta * fraction) % 360.0
 
 
+def _casrep_events() -> list[dict]:
+    """Facts used to write the CASREP messages. Capacity is read back from the text."""
+    return [
+        {
+            "ship_id": "DDG-101",
+            "time_seconds": 12.0,
+            "capacity_percent": 60,
+            "radar_status": "DEGRADED",
+            "category": "2",
+            "nomenclature": "AN/SPY-1D(V)",
+            "serial": "SPY1D-101-04",
+            "description": (
+                "INTERMITTENT FAILURE OF TRANSMITTER MODULES ON ARRAY FACE 2. "
+                "COOLANT PUMP DISCHARGE PRESSURE BELOW LIMIT. SEARCH VOLUME REDUCED."
+            ),
+            "impact": (
+                "AIR SEARCH RANGE AND TRACK CAPACITY REDUCED TO ABOUT 60 PERCENT. "
+                "SHIP CAN STILL COVER AN ASSIGNED SECTOR AT SHORTER RANGE."
+            ),
+            "parts": [
+                ("5840-01-555-0142", "TRANSMITTER MODULE", 6),
+                ("4320-01-441-2208", "COOLANT PUMP", 1),
+            ],
+            "etr_hours": 18,
+            "assistance": "NOT REQUIRED. SHIP'S FORCE EFFECTING REPAIRS.",
+            "fault_code": "XMTR_MODULE",
+            "seq": "001",
+        },
+        {
+            "ship_id": "CG-58",
+            "time_seconds": 32.0,
+            "capacity_percent": 0,
+            "radar_status": "FAILED",
+            "category": "4",
+            "nomenclature": "AN/SPY-1B",
+            "serial": "SPY1B-058-02",
+            "description": (
+                "PRIMARY TRANSMITTER TRIPPED OFF LINE. HIGH-VOLTAGE POWER SUPPLY "
+                "WILL NOT RESET. ARRAY IS RADIATING NO ENERGY."
+            ),
+            "impact": (
+                "AIR-SEARCH RADAR IS NOT AVAILABLE. NO REMAINING CAPABILITY ON THIS "
+                "SYSTEM. SHIP CANNOT CONTRIBUTE TO THE GROUP AIR PICTURE."
+            ),
+            "parts": [
+                ("6130-01-318-7740", "HIGH VOLTAGE POWER SUPPLY", 1),
+                ("5840-01-227-6619", "TRANSMITTER ASSEMBLY", 1),
+            ],
+            "etr_hours": 72,
+            "assistance": "REQUEST TECH ASSIST FROM CSG STAFF. PARTS NOT ON BOARD.",
+            "fault_code": "TRANSMITTER_FAIL",
+            "seq": "001",
+        },
+        {
+            "ship_id": "DDG-112",
+            "time_seconds": 52.0,
+            "capacity_percent": 40,
+            "radar_status": "DEGRADED",
+            "category": "3",
+            "nomenclature": "AN/SPY-1D(V)",
+            "serial": "SPY1D-112-07",
+            "description": (
+                "SIGNAL PROCESSOR OVERTEMP. ONE OF TWO PROCESSOR STRINGS SECURED. "
+                "DETECTION THRESHOLD RAISED TO LIMIT FALSE TRACKS."
+            ),
+            "impact": (
+                "TRACK QUALITY AND INSTRUMENTED RANGE REDUCED. ABOUT 40 PERCENT "
+                "OF DESIGN CAPACITY REMAINS. SECTOR WATCH STILL POSSIBLE."
+            ),
+            "parts": [
+                ("5840-01-602-1184", "SIGNAL PROCESSOR CARD", 2),
+                ("4130-01-509-3301", "PROCESSOR COOLING UNIT", 1),
+            ],
+            "etr_hours": 36,
+            "assistance": "NOT REQUIRED UNLESS SECOND STRING FAILS.",
+            "fault_code": "PROCESSOR_OVERTEMP",
+            "seq": "001",
+        },
+    ]
+
+
+def _dtg(elapsed_s: float) -> str:
+    """Navy date-time group for a scenario offset, down to the second."""
+    stamp = SCENARIO_START + pd.Timedelta(seconds=float(elapsed_s))
+    months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+    return (
+        f"{stamp.day:02d}{stamp.hour:02d}{stamp.minute:02d}{stamp.second:02d}Z "
+        f"{months[stamp.month - 1]} {stamp.year % 100:02d}"
+    )
+
+
+def _position_text(latitude: float, longitude: float) -> str:
+    """Latitude and longitude in the form used in a naval message."""
+    ns = "N" if latitude >= 0 else "S"
+    ew = "E" if longitude >= 0 else "W"
+    return f"{abs(latitude):05.2f}{ns} {abs(longitude):06.2f}{ew}"
+
+
+def render_casrep(event: dict, ship: dict, latitude: float, longitude: float) -> str:
+    """One INITIAL CASREP. Status and remaining percent are lines the parser reads."""
+    reference = f"CASREP-{event['ship_id']}-{event['seq']}"
+    parts = "\n".join(
+        f"   {index}. NSN {nsn}  {name}  QTY {qty}"
+        for index, (nsn, name, qty) in enumerate(event["parts"], start=1)
+    )
+    return "\n".join(
+        [
+            "UNCLAS",
+            f"MSGID/CASREP/{ship['ship_name'].upper()}/{event['seq']}",
+            f"REF/{reference}",
+            "CASREP/INITIAL",
+            f"1. UNIT: {ship['ship_name'].upper()} ({event['ship_id']})",
+            f"2. DTG: {_dtg(event['time_seconds'])}",
+            f"3. POSITION: {_position_text(latitude, longitude)}",
+            "4. EQUIPMENT:",
+            f"   A. NOMENCLATURE: {event['nomenclature']}",
+            "   B. EIC: RADA",
+            f"   C. SERIAL: {event['serial']}",
+            f"5. CASUALTY CATEGORY: {event['category']}",
+            f"6. DESCRIPTION: {event['description']}",
+            f"7. MISSION IMPACT: {event['impact']}",
+            f"8. REMAINING CAPABILITY: {int(event['capacity_percent'])} PERCENT",
+            f"9. RADAR STATUS: {event['radar_status']}",
+            "10. PARTS REQUIRED:",
+            parts,
+            f"11. ESTIMATED TIME TO REPAIR: {int(event['etr_hours'])} HOURS",
+            f"12. TECHNICAL ASSISTANCE: {event['assistance']}",
+            "13. REMARKS: SHIP REMAINS IN COMPANY. DO NOT CLOSE THE THREAT AXIS.",
+            f"BT  {reference}",
+        ]
+    )
+
+
+def parse_casrep(text: str) -> dict:
+    """Pull ship, time, status, and remaining capacity out of a CASREP body."""
+    ship_match = re.search(r"UNIT:.*\(([A-Z]+-\d+)\)", text)
+    ref_match = re.search(r"REF/(CASREP-[A-Z]+-\d+-\d+)", text)
+    time_match = re.search(r"DTG:\s*(\d{2})(\d{2})(\d{2})(\d{2})Z", text)
+    capacity_match = re.search(r"REMAINING CAPABILITY:\s*(\d+)\s*PERCENT", text)
+    status_match = re.search(r"RADAR STATUS:\s*(OK|DEGRADED|FAILED)", text)
+    if not all((ship_match, ref_match, time_match, capacity_match, status_match)):
+        raise ValueError("CASREP is missing ship, reference, DTG, status, or remaining capability")
+    day = int(time_match.group(1))
+    hour = int(time_match.group(2))
+    minute = int(time_match.group(3))
+    second = int(time_match.group(4))
+    stamp = SCENARIO_START
+    elapsed = ((day - stamp.day) * 86400) + hour * 3600 + minute * 60 + second - (
+        stamp.hour * 3600 + stamp.minute * 60 + stamp.second
+    )
+    return {
+        "ship_id": ship_match.group(1),
+        "casrep_reference": ref_match.group(1),
+        "time_seconds": float(elapsed),
+        "capacity_percent": float(capacity_match.group(1)),
+        "radar_status": status_match.group(1),
+    }
+
+
+def write_casreps(
+    events: list[dict],
+    positions: dict[tuple[str, float], tuple[float, float]],
+    folder: Path = CASREP_DIR,
+) -> list[dict]:
+    """Write each CASREP, then return the status and capacity parsed from the files."""
+    folder.mkdir(parents=True, exist_ok=True)
+    fleet = {ship["ship_id"]: ship for ship in FLEET}
+    parsed: list[dict] = []
+    index_lines = ["CASREP log", ""]
+    for event in events:
+        ship = fleet[event["ship_id"]]
+        latitude, longitude = positions[(event["ship_id"], event["time_seconds"])]
+        body = render_casrep(event, ship, latitude, longitude)
+        reference = f"CASREP-{event['ship_id']}-{event['seq']}"
+        path = folder / f"{reference}.txt"
+        path.write_text(body + "\n", encoding="utf-8")
+        record = parse_casrep(path.read_text(encoding="utf-8"))
+        record["fault_code"] = event["fault_code"]
+        parsed.append(record)
+        index_lines.append(
+            f"{record['casrep_reference']}  T+{record['time_seconds']:.0f}s  "
+            f"{record['ship_id']}  {record['radar_status']}  {record['capacity_percent']:.0f}%"
+        )
+    (folder / "INDEX.txt").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+    return parsed
+
+
+def _capacity_from_casreps(casreps: list[dict], ship_id: str, elapsed_s: float) -> tuple[float, str]:
+    """Latest CASREP at or before this time. No report means full capacity."""
+    active = [
+        item
+        for item in casreps
+        if item["ship_id"] == ship_id and item["time_seconds"] <= elapsed_s + 1e-6
+    ]
+    if not active:
+        return 100.0, "NONE"
+    latest = max(active, key=lambda item: item["time_seconds"])
+    return float(latest["capacity_percent"]), str(latest["casrep_reference"])
+
+
+def _ship_at_time(
+    ship_id: str,
+    elapsed_s: float,
+    times: np.ndarray,
+    carrier_track: list[tuple[float, float, float]],
+    offsets: dict[str, tuple[float, float]],
+    start_heading: float,
+) -> tuple[float, float]:
+    """Formation position of one ship at a scenario time, used in the CASREP."""
+    index = int(np.searchsorted(times, elapsed_s, side="left"))
+    index = min(max(index, 0), len(times) - 1)
+    carrier_lat, carrier_lon, heading = carrier_track[index]
+    theta = np.deg2rad(heading - start_heading)
+    cosine, sine = float(np.cos(theta)), float(np.sin(theta))
+    east, north = offsets[ship_id]
+    rotated_east = east * cosine + north * sine
+    rotated_north = -east * sine + north * cosine
+    return to_latlon(rotated_east, rotated_north, carrier_lat, carrier_lon)
+
+
 def build_snooze_cruise() -> pd.DataFrame:
-    """Sample a moving formation and the capacity schedule into one table.
+    """Sample a moving formation. Radar capacity is read from the CASREP files.
 
     The group steams about 12 km and turns during the 80-second run.
-    Capacity changes are rows in this same file: DDG-101 to 60% at 12 s,
-    CG-58 to 0% at 32 s, and DDG-112 to 40% at 52 s.
+    CASREPs are written to casreps/, then remaining capability is parsed
+    back out and stored in this table: DDG-101 at 12 s, CG-58 at 32 s,
+    DDG-112 at 52 s.
     """
     duration = float(TOTAL_RUNTIME_SECONDS)
     times = np.arange(0.0, duration + 1e-9, float(UPDATE_INTERVAL_SECONDS))
@@ -1450,6 +1690,16 @@ def build_snooze_cruise() -> pd.DataFrame:
         carrier_track.append((lat, lon, heading))
         previous = float(instant)
 
+    events = _casrep_events()
+    positions = {
+        (event["ship_id"], event["time_seconds"]): _ship_at_time(
+            event["ship_id"], event["time_seconds"], times, carrier_track, offsets, start_heading
+        )
+        for event in events
+    }
+    casreps = write_casreps(events, positions)
+    fault_by_ref = {item["casrep_reference"]: item["fault_code"] for item in casreps}
+
     rows: list[dict] = []
     for (instant, (carrier_lat, carrier_lon, heading)), _index in zip(
         zip(times, carrier_track), range(len(times))
@@ -1462,14 +1712,18 @@ def build_snooze_cruise() -> pd.DataFrame:
             rotated_east = east * cosine + north * sine
             rotated_north = -east * sine + north * cosine
             ship_lat, ship_lon = to_latlon(rotated_east, rotated_north, carrier_lat, carrier_lon)
-            percent = _scheduled_capacity(ship["ship_id"], float(instant))
+            percent, casrep_reference = _capacity_from_casreps(casreps, ship["ship_id"], float(instant))
+            status = "OK"
+            for item in casreps:
+                if item["casrep_reference"] == casrep_reference:
+                    status = item["radar_status"]
             scale = percent / 100.0
             if percent >= 99.5:
-                status, mode, power, cooling, fault = "OK", "SEARCH", "NOMINAL", "NOMINAL", "NONE"
+                mode, power, cooling, fault = "SEARCH", "NOMINAL", "NOMINAL", "NONE"
             elif percent <= 0.5:
-                status, mode, power, cooling, fault = "FAILED", "STANDBY", "OFF", "SHUTDOWN", "TRANSMITTER_FAIL"
+                mode, power, cooling, fault = "STANDBY", "OFF", "SHUTDOWN", fault_by_ref.get(casrep_reference, "TRANSMITTER_FAIL")
             else:
-                status, mode, power, cooling, fault = "DEGRADED", "DEGRADED_SEARCH", "REDUCED", "ELEVATED", "RANGE_LIMIT"
+                mode, power, cooling, fault = "DEGRADED_SEARCH", "REDUCED", "ELEVATED", fault_by_ref.get(casrep_reference, "RANGE_LIMIT")
             rows.append(
                 {
                     "time_seconds": float(instant),
@@ -1495,6 +1749,7 @@ def build_snooze_cruise() -> pd.DataFrame:
                     "threat_bearing_deg": 30.0 + 25.0 * (float(instant) / duration),
                     "threat_range_km": 160.0,
                     "threat_priority": 1,
+                    "casrep_reference": casrep_reference,
                     "power_status": power,
                     "cooling_status": cooling,
                     "last_maintenance": "2026-10-15",
@@ -1511,8 +1766,8 @@ def load_snooze(path: Path) -> pd.DataFrame:
         rewrite = True
     else:
         frame = pd.read_csv(path)
-        if "threat_bearing_deg" not in frame.columns:
-            print(f"{path} has no threat_bearing_deg column. Writing a fresh sample.")
+        if "threat_bearing_deg" not in frame.columns or "casrep_reference" not in frame.columns:
+            print(f"{path} is missing threat or CASREP columns. Writing a fresh sample.")
             rewrite = True
     if rewrite:
         frame = build_snooze_cruise()
@@ -1567,6 +1822,7 @@ def load_snooze(path: Path) -> pd.DataFrame:
         ("cooling_status", "NOMINAL"),
         ("last_maintenance", "2026-10-15"),
         ("fault_code", "NONE"),
+        ("casrep_reference", "NONE"),
     ):
         if optional not in frame.columns:
             frame[optional] = default
@@ -1590,17 +1846,6 @@ def _bracket(group: pd.DataFrame, elapsed_s: float) -> tuple[pd.Series, pd.Serie
     span = float(times[high] - times[low])
     fraction = 0.0 if span <= 0 else (elapsed_s - float(times[low])) / span
     return group.iloc[low], group.iloc[high], fraction
-
-
-def _scheduled_capacity(ship_id: str, elapsed_s: float) -> float:
-    """Capacity written into the sample snooze_cruise.csv. Edit that file to change it."""
-    if ship_id == "DDG-101" and elapsed_s >= 12:
-        return 60.0
-    if ship_id == "CG-58" and elapsed_s >= 32:
-        return 0.0
-    if ship_id == "DDG-112" and elapsed_s >= 52:
-        return 40.0
-    return 100.0
 
 
 def snapshot_at(group: pd.DataFrame, elapsed_s: float) -> dict:
@@ -1636,6 +1881,11 @@ def snapshot_at(group: pd.DataFrame, elapsed_s: float) -> dict:
         "cooling_status": str(low["cooling_status"]),
         "last_maintenance": str(low["last_maintenance"]),
         "fault_code": str(low["fault_code"]),
+        "casrep_reference": (
+            str(low["casrep_reference"])
+            if "casrep_reference" in low.index and pd.notna(low["casrep_reference"])
+            else "NONE"
+        ),
         "threat_bearing_deg": _lerp_heading(
             float(low["threat_bearing_deg"]), float(high["threat_bearing_deg"]), fraction
         ),
@@ -1664,6 +1914,7 @@ def print_ship_state(state: pd.DataFrame) -> None:
         print(
             f"    position {row.latitude:.4f}, {row.longitude:.4f}  "
             f"heading {row.current_heading:.0f}°  last maintenance {row.last_maintenance}"
+            f"  CASREP {row.casrep_reference}"
         )
 
 
@@ -1744,6 +1995,8 @@ def run_monitor(
     )
     print(f"Data file: {SNOOZE_FILE}")
     print(f"Schedule in file: {schedule_text(cruise)}.")
+    print(f"CASREP texts: {CASREP_DIR}/")
+    announced: set[str] = set()
     try:
         for cycle in range(updates):
             remaining = max(0.0, total_runtime - cycle * interval)
@@ -1765,6 +2018,15 @@ def run_monitor(
                 f"{remaining:.0f} s remaining  |  threat {threat:.0f}° ---"
             )
             print_ship_state(state)
+            for row in state.itertuples(index=False):
+                reference = str(row.casrep_reference)
+                if reference not in {"NONE", "nan"} and reference not in announced:
+                    announced.add(reference)
+                    print(
+                        f"CASREP now in effect: {reference}  "
+                        f"{row.ship_name}  {row.radar_status}  {row.capacity_percent:.0f}%"
+                    )
+                    print(f"  Full text: {CASREP_DIR / (reference + '.txt')}")
             analyze_frames(
                 scenario.radar_frame(),
                 scenario.location_frame(),
