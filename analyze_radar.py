@@ -36,16 +36,16 @@ snooze_cruise.csv is the only live data file. One row per ship per time step:
 
 CASREP texts are also saved under casreps/. capacity_percent and radar_status
 in snooze_cruise are parsed from those messages. Courses cover the threat
-axis from stations at least 25 degrees off that axis, and they also limit
-time spent inside any storm within 60 nautical miles of the carrier.
+axis from stations at least 25 degrees off that axis, stay in the water, and
+limit time spent inside any storm within 60 nautical miles of the carrier.
 A CASREP names the radar and the relative sector that is degraded. A course
 may be a turn in place, or a move followed by a turn, whichever restores
 more coverage with less disruption.
 
-The 4-second loop does not call government weather APIs. Those services are
+The 2-second loop does not call government weather APIs. Those services are
 the weather, monitor, and advise commands, and monitor will not poll faster
 than once a minute. The loop reads weather columns already stored in
-snooze_cruise. That split is deliberate: a 4-second poll would fight the
+snooze_cruise. That split is deliberate: a 2-second poll would fight the
 forecast tools' own rate limit.
 """
 
@@ -3345,6 +3345,19 @@ def _sector_brought(ship: dict, heading: float, threat: float | None) -> str:
     return f"{radar} face {face} rel {start:.0f}-{end:.0f}{aim}"
 
 
+def _land_hits(moves: list[dict], origin_lat: float, origin_lon: float) -> int:
+    """Stations or transits that still touch land after the water search."""
+    hits = 0
+    for move in moves:
+        if move["travel_km"] <= 0.5:
+            continue
+        start_east, start_north = to_xy(move["latitude"], move["longitude"], origin_lat, origin_lon)
+        end_east, end_north = to_xy(move["station_latitude"], move["station_longitude"], origin_lat, origin_lon)
+        if not _track_in_water(start_east, start_north, end_east, end_north, origin_lat, origin_lon):
+            hits += 1
+    return hits
+
+
 def _jammed_face_penalty(moves: list[dict], jammer: dict | None, threat: float | None) -> int:
     """Count ships whose degraded face still points at the jammer or the threat."""
     if not jammer:
@@ -3359,6 +3372,99 @@ def _jammed_face_penalty(moves: list[dict], jammer: dict | None, threat: float |
         if near_jammer or near_threat:
             penalty += 1
     return penalty
+
+
+# Lower Chesapeake and the Virginia Capes. Rings are land. The formation's
+# track sits in the roads; stations south of the channel, inland of the
+# Elizabeth River, on the Cape Henry spit, or on the Hampton bank are ashore.
+LAND_RINGS = (
+    ((36.55, -76.70), (36.55, -75.95), (36.80, -75.95), (36.80, -76.70)),
+    ((36.80, -76.40), (36.80, -76.90), (37.25, -76.90), (37.25, -76.48), (37.00, -76.40)),
+    ((36.80, -76.10), (36.80, -75.90), (37.02, -75.90), (36.97, -76.02), (36.88, -76.10)),
+    ((37.00, -76.55), (37.00, -76.34), (37.50, -76.45), (37.50, -76.80)),
+    ((37.15, -76.25), (37.15, -75.75), (37.70, -75.60), (37.70, -76.40)),
+)
+
+
+def _ring_contains(ring: tuple, latitude: float, longitude: float) -> bool:
+    """Ray cast. The ring is a closed land outline in latitude, longitude."""
+    inside = False
+    previous = len(ring) - 1
+    for index, (lat_i, lon_i) in enumerate(ring):
+        lat_j, lon_j = ring[previous]
+        if (lon_i > longitude) != (lon_j > longitude):
+            edge = (lat_j - lat_i) * (longitude - lon_i) / (lon_j - lon_i) + lat_i
+            if latitude < edge:
+                inside = not inside
+        previous = index
+    return inside
+
+
+def _on_land(latitude: float, longitude: float) -> bool:
+    """True when this point lies on the coastline approximation."""
+    return any(_ring_contains(ring, latitude, longitude) for ring in LAND_RINGS)
+
+
+def _track_in_water(
+    start_east: float,
+    start_north: float,
+    end_east: float,
+    end_north: float,
+    origin_lat: float,
+    origin_lon: float,
+) -> bool:
+    """True when the station and the straight transit both stay off land."""
+    steps = 16
+    for step in range(steps + 1):
+        fraction = step / steps
+        east = start_east + (end_east - start_east) * fraction
+        north = start_north + (end_north - start_north) * fraction
+        latitude, longitude = to_latlon(east, north, origin_lat, origin_lon)
+        if _on_land(latitude, longitude):
+            return False
+    return True
+
+
+def _station_in_water(
+    station_east: float,
+    station_north: float,
+    current_east: float,
+    current_north: float,
+    origin_lat: float,
+    origin_lon: float,
+    threat_bearing: float | None,
+) -> tuple[float, float]:
+    """Keep the station. If it or the path crosses land, take the nearest water point."""
+    if _track_in_water(current_east, current_north, station_east, station_north, origin_lat, origin_lon):
+        return station_east, station_north
+    base_bearing = bearing_deg(station_east, station_north)
+    base_range = float(np.hypot(station_east, station_north))
+    ranges = [base_range] if base_range > 1.0 else []
+    for extra in (8.0, 12.0, 16.0, 20.0, 24.0):
+        if all(abs(extra - chosen) > 0.5 for chosen in ranges):
+            ranges.append(extra)
+    best: tuple[float, float] | None = None
+    best_key: tuple | None = None
+    for range_km in ranges:
+        for delta in (0, 8, -8, 16, -16, 24, -24, 36, -36, 50, -50, 70, -70, 90, -90, 120, -120, 160, -160):
+            bearing = (base_bearing + delta) % 360.0
+            east, north = point_at(bearing, range_km)
+            travel = float(np.hypot(east - current_east, north - current_north))
+            course = bearing_deg(east - current_east, north - current_north) if travel > 0.05 else bearing
+            if threat_bearing is not None and travel > 0.5:
+                if wrap_delta(bearing, threat_bearing) < THREAT_EXCLUSION_DEG - 0.1:
+                    continue
+                if not _heading_clear(course, threat_bearing):
+                    continue
+            if not _track_in_water(current_east, current_north, east, north, origin_lat, origin_lon):
+                continue
+            key = (abs(delta), abs(range_km - base_range), travel)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = (east, north)
+    if best is None:
+        return current_east, current_north
+    return best
 
 
 def _heading_clear(heading: float, threat: float, exclusion: float = THREAT_EXCLUSION_DEG) -> bool:
@@ -3630,6 +3736,24 @@ def _build_plan(
                 if threat_bearing is not None and not _heading_clear(course, threat_bearing):
                     course = _off_threat_axis(course, threat_bearing)
                 travel = 0.0
+        if not turn_only:
+            station_east, station_north = _station_in_water(
+                station_east,
+                station_north,
+                current_east,
+                current_north,
+                origin_lat,
+                origin_lon,
+                threat_bearing,
+            )
+            course = bearing_deg(station_east - current_east, station_north - current_north)
+            travel = float(np.hypot(station_east - current_east, station_north - current_north))
+            station_bearing = bearing_deg(station_east, station_north)
+            if travel < 0.5:
+                station_east, station_north = current_east, current_north
+                travel = 0.0
+                if float(np.hypot(current_east, current_north)) > 0.1:
+                    station_bearing = bearing_deg(current_east, current_north)
         if travel < 0.5 and escort["heading"] is not None and threat_bearing is None and not turn_only:
             course = escort["heading"]
         if turn_only:
@@ -3703,6 +3827,9 @@ def _build_plan(
         if storms and not turn_only and _inside_storm(0.0, 0.0, storms) is not None:
             # The carrier is the unit that must leave a nearby storm first.
             hvu_east, hvu_north = _leave_storm(0.0, 0.0, 0.0, 0.0, storms, threat_bearing)
+            hvu_east, hvu_north = _station_in_water(
+                hvu_east, hvu_north, 0.0, 0.0, origin_lat, origin_lon, threat_bearing
+            )
             hvu_travel = float(np.hypot(hvu_east, hvu_north))
             if hvu_travel > 0.5:
                 hold_heading = bearing_deg(hvu_east, hvu_north)
@@ -3805,6 +3932,7 @@ def _build_plan(
         - 40.0 * unsafe
         - 15.0 * storm_hours
         - 8.0 * _jammed_face_penalty(moves, jammer, threat_bearing)
+        - 80.0 * _land_hits(moves, origin_lat, origin_lon)
     )
 
     return {
@@ -4001,7 +4129,10 @@ def recommend_courses(
                 f"Jammer {jammer['bearing']:.0f}°  {jammer['erp']:.0f} kW  "
                 f"SJR {jammer['sjr']:.1f} dB"
             )
+    water_note = " Stations and the tracks between them stay in the water."
     for plan in plans:
+        if water_note not in plan["rationale"]:
+            plan["rationale"] = plan["rationale"] + water_note
         plan["coverage_gain"] = plan["threat_pct"] - baseline["threat_pct"]
     plans.sort(key=lambda plan: plan["score"], reverse=True)
     turn_plan = next(plan for plan in plans if plan.get("turn_only"))
