@@ -1,0 +1,85 @@
+{
+  "_comment": "Notional assignments only. Several bands are left open on purpose so a conflicting request can be offered another range of the same width. Not a real frequency plan.",
+  "assignments": [
+    {
+      "ship": "SHIP_A",
+      "emitter_name": "N-RADAR-A1",
+      "freq_min_mhz": 9000,
+      "freq_max_mhz": 9200,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_A",
+      "emitter_name": "N-LINK-A1",
+      "freq_min_mhz": 4500,
+      "freq_max_mhz": 4600,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_A",
+      "emitter_name": "N-VOICE-A1",
+      "freq_min_mhz": 2300,
+      "freq_max_mhz": 2400,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_B",
+      "emitter_name": "N-RADAR-B1",
+      "freq_min_mhz": 3200,
+      "freq_max_mhz": 3400,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_B",
+      "emitter_name": "N-LINK-B1",
+      "freq_min_mhz": 5100,
+      "freq_max_mhz": 5200,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_B",
+      "emitter_name": "N-VOICE-B1",
+      "freq_min_mhz": 3480,
+      "freq_max_mhz": 3560,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_B",
+      "emitter_name": "N-RADAR-B2",
+      "freq_min_mhz": 11000,
+      "freq_max_mhz": 11200,
+      "start": "2026-11-05T15:00:00Z",
+      "end": "2026-11-05T18:00:00Z"
+    },
+    {
+      "ship": "SHIP_C",
+      "emitter_name": "N-RADAR-C1",
+      "freq_min_mhz": 9700,
+      "freq_max_mhz": 9900,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_C",
+      "emitter_name": "N-LINK-C1",
+      "freq_min_mhz": 3600,
+      "freq_max_mhz": 3700,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    },
+    {
+      "ship": "SHIP_C",
+      "emitter_name": "N-VOICE-C2",
+      "freq_min_mhz": 7600,
+      "freq_max_mhz": 7700,
+      "start": "2026-11-05T10:00:00Z",
+      "end": "2026-11-05T14:00:00Z"
+    }
+  ]
+}
